@@ -11,16 +11,6 @@
         "apiKey": "not-used"
       },
       "models": {
-        "qoder-cn": {
-          "name": "Qoder CN Auto",
-          "reasoning": true,
-          "variants": {
-            "low": { "reasoningEffort": "low" },
-            "medium": { "reasoningEffort": "medium" },
-            "high": { "reasoningEffort": "high" },
-            "max": { "reasoningEffort": "max" }
-          }
-        },
         "auto": {
           "name": "Auto",
           "reasoning": true,
@@ -31,8 +21,8 @@
             "max": { "reasoningEffort": "max" }
           }
         },
-        "qwen3.8-max-preview": {
-          "name": "Qwen3.8-Max-Preview",
+        "qwen3.8-max": {
+          "name": "Qwen3.8-Max",
           "reasoning": true,
           "variants": {
             "low": { "reasoningEffort": "low" },
@@ -40,22 +30,6 @@
             "high": { "reasoningEffort": "high" },
             "max": { "reasoningEffort": "max" }
           }
-        },
-        "qwen3.8-max-preview-effort-low": {
-          "name": "Qwen3.8-Max-Preview low",
-          "reasoning": true
-        },
-        "qwen3.8-max-preview-effort-medium": {
-          "name": "Qwen3.8-Max-Preview medium",
-          "reasoning": true
-        },
-        "qwen3.8-max-preview-effort-high": {
-          "name": "Qwen3.8-Max-Preview high",
-          "reasoning": true
-        },
-        "qwen3.8-max-preview-effort-max": {
-          "name": "Qwen3.8-Max-Preview max",
-          "reasoning": true
         },
         "qwen3.7-max": {
           "name": "Qwen3.7-Max",
@@ -66,22 +40,6 @@
             "high": { "reasoningEffort": "high" },
             "max": { "reasoningEffort": "max" }
           }
-        },
-        "qwen3.7-max-effort-low": {
-          "name": "Qwen3.7-Max low",
-          "reasoning": true
-        },
-        "qwen3.7-max-effort-medium": {
-          "name": "Qwen3.7-Max medium",
-          "reasoning": true
-        },
-        "qwen3.7-max-effort-high": {
-          "name": "Qwen3.7-Max high",
-          "reasoning": true
-        },
-        "qwen3.7-max-effort-max": {
-          "name": "Qwen3.7-Max max",
-          "reasoning": true
         },
         "glm-5.2": {
           "name": "GLM-5.2",

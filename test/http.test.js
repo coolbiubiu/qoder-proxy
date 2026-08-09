@@ -23,7 +23,7 @@ test('health and models endpoints are OpenAI-compatible enough for discovery', a
     assert.equal(models.status, 200);
     const body = await models.json();
     assert.equal(body.object, 'list');
-    assert.equal(body.data[0].id, 'qoder-cn');
+    assert.equal(body.data[0].id, 'auto');
     assert.equal(body.data.some((model) => model.id === 'qwen3.7-max'), true);
     assert.equal(body.data.some((model) => model.id === 'deepseek-v4-flash'), true);
   } finally {

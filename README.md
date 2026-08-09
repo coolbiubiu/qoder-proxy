@@ -187,9 +187,9 @@ CLI_BACKEND=global   # 使用 qodercli
 
 ## 支持的模型
 
-`qoder-cn`、`auto`、`qwen3.8-max-preview`、`qwen3.7-max`、`qwen3.7-plus`、`glm-5.2`、`kimi-k2.7-code`、`minimax-m2.7`、`qwen3.6-flash`、`deepseek-v4-pro`、`deepseek-v4-flash`
+`auto`、`qwen3.8-max`、`qwen3.7-max`、`qwen3.7-plus`、`qwen3.6-flash`、`deepseek-v4-pro`、`deepseek-v4-flash`、`glm-5.2`、`kimi-k2.7-code`、`minimax-m2.7`
 
-推理强度别名：`qwen3.8-max-preview-effort-low`、`-medium`、`-high`、`-max`，以及 `qwen3.7-max-effort-low`、`-medium`、`-high`、`-max`
+旧版 `-effort-*` 后缀的模型 ID 仍然兼容，会自动解析为基础模型加推理强度参数。
 
 ## 本地客户端适配
 

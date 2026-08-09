@@ -94,7 +94,7 @@ async function testModels() {
   assert(Array.isArray(data.data) && data.data.length > 0, 'Expected non-empty model list');
 
   const ids = data.data.map((m) => m.id);
-  assert(ids.includes('qoder-cn'), 'Missing model "qoder-cn"');
+  assert(ids.includes('auto'), 'Missing model "auto"');
   assert(ids.includes('qwen3.7-max'), 'Missing model "qwen3.7-max"');
   assert(ids.includes('deepseek-v4-flash'), 'Missing model "deepseek-v4-flash"');
 
@@ -103,7 +103,7 @@ async function testModels() {
 
 async function testChatCompletions() {
   const { status, data } = await request('POST', '/v1/chat/completions', {
-    model: 'qoder-cn',
+    model: 'auto',
     messages: [{ role: 'user', content: 'Reply with exactly: SMOKE_OK' }],
   });
   assert(status === 200, `Expected status 200, got ${status}`);
@@ -118,7 +118,7 @@ async function testChatCompletionsStream() {
     method: 'POST',
     headers: authHeaders(),
     body: JSON.stringify({
-      model: 'qoder-cn',
+      model: 'auto',
       stream: true,
       messages: [{ role: 'user', content: 'Reply with exactly: SMOKE_OK' }],
     }),
@@ -136,7 +136,7 @@ async function testChatCompletionsStream() {
 
 async function testAnthropicMessages() {
   const { status, data } = await request('POST', '/v1/messages', {
-    model: 'qoder-cn',
+    model: 'auto',
     max_tokens: 64,
     messages: [{ role: 'user', content: 'Reply with exactly: SMOKE_OK' }],
   });

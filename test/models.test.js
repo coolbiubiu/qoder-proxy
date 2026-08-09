@@ -16,26 +16,26 @@ test('all models have required fields: id, name, cliModel, reasoning', () => {
   }
 });
 
-test('effort alias models have effortAlias: true', () => {
-  const effortIds = [
-    'qwen3.7-max-effort-low',
-    'qwen3.7-max-effort-medium',
-    'qwen3.7-max-effort-high',
-    'qwen3.7-max-effort-max',
+test('model list contains only the 10 official models', () => {
+  const expectedIds = [
+    'auto',
+    'qwen3.8-max',
+    'qwen3.7-max',
+    'qwen3.7-plus',
+    'qwen3.6-flash',
+    'deepseek-v4-pro',
+    'deepseek-v4-flash',
+    'glm-5.2',
+    'kimi-k2.7-code',
+    'minimax-m2.7',
   ];
-  for (const id of effortIds) {
-    const model = MODELS.find((m) => m.id === id);
-    assert.ok(model, `effort model ${id} should exist`);
-    assert.equal(model.effortAlias, true, `model ${id} should have effortAlias: true`);
-  }
+  assert.deepEqual(MODELS.map((m) => m.id), expectedIds);
 });
 
-test('non-effort models do not have effortAlias', () => {
-  const nonEffort = MODELS.filter((m) => !m.id.includes('-effort-'));
-  assert.ok(nonEffort.length > 0, 'should have non-effort models');
-  for (const model of nonEffort) {
-    assert.equal(model.effortAlias, undefined, `model ${model.id} should not have effortAlias`);
-  }
+test('no model exposes a duplicate underlying CLI model', () => {
+  const cliModels = MODELS.map((m) => m.cliModel);
+  assert.equal(new Set(cliModels).size, cliModels.length);
+  assert.equal(MODELS.some((m) => m.effortAlias), false);
 });
 
 test('resolveModelRoute parses effort suffixes correctly', () => {
@@ -57,10 +57,10 @@ test('resolveModelRoute parses effort suffixes correctly', () => {
 });
 
 test('getModel returns correct model for known ID', () => {
-  const model = getModel('qoder-cn');
+  const model = getModel('auto');
   assert.ok(model);
-  assert.equal(model.id, 'qoder-cn');
-  assert.equal(model.name, 'Qoder CN Auto');
+  assert.equal(model.id, 'auto');
+  assert.equal(model.name, 'Auto');
   assert.equal(model.cliModel, 'auto');
   assert.equal(model.reasoning, true);
 
@@ -76,6 +76,6 @@ test('getModel returns undefined for unknown ID', () => {
   assert.equal(getModel(undefined), undefined);
 });
 
-test('DEFAULT_MODEL_ID is qoder-cn', () => {
-  assert.equal(DEFAULT_MODEL_ID, 'qoder-cn');
+test('DEFAULT_MODEL_ID is auto', () => {
+  assert.equal(DEFAULT_MODEL_ID, 'auto');
 });
