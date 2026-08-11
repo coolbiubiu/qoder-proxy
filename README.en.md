@@ -174,6 +174,14 @@ Start:
 npm start
 ```
 
+You can also compile to a single file with esbuild and run the bundle (output at `dist/server.js`):
+
+```powershell
+npm run build        # compile
+npm run start:prod   # run the compiled bundle
+npm run build:start  # compile and start in one step
+```
+
 On Windows, you can also double-click `start-proxy.cmd`.
 
 Default local address:

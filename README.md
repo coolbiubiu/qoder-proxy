@@ -157,6 +157,14 @@ CN 版 PAT 创建入口：https://qoder.com.cn/account/integrations
 npm start
 ```
 
+也可以用 esbuild 编译为单文件后启动（产物在 `dist/server.js`）：
+
+```powershell
+npm run build        # 编译
+npm run start:prod   # 启动编译产物
+npm run build:start  # 编译并直接启动
+```
+
 Windows 也可以双击 `start-proxy.cmd`。
 
 启动后默认地址为：

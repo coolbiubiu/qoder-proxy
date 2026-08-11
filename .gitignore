@@ -4,6 +4,7 @@ node_modules/
 !.env.example
 *.log
 .runtime/
+dist/
 /server.js
 MAINTENANCE_LOCAL.md
 usage.json
