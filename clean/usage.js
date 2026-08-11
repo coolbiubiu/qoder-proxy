@@ -3,7 +3,9 @@
 const fs = require('fs');
 const path = require('path');
 
-const USAGE_FILE = path.join(__dirname, '..', 'usage.json');
+// QODER_PROXY_USAGE_FILE lets tests point the persisted stats at a throwaway
+// file so `npm test` never touches the user's real usage.json.
+const USAGE_FILE = process.env.QODER_PROXY_USAGE_FILE || path.join(__dirname, '..', 'usage.json');
 
 const stats = {
   startedAt: new Date().toISOString(),
@@ -116,7 +118,8 @@ function resetUsage() {
 
 function saveUsage() {
   try {
-    const data = JSON.stringify(getUsage(), null, 2);
+    // `day` records which date `requestsToday` belongs to — see loadUsage().
+    const data = JSON.stringify({ ...getUsage(), day: getToday() }, null, 2);
     // Write-then-rename so a crash mid-write can never leave a truncated
     // usage.json behind (rename is atomic on the same filesystem).
     const tmpFile = `${USAGE_FILE}.${process.pid}.tmp`;
@@ -134,7 +137,11 @@ function loadUsage() {
       if (data && typeof data === 'object') {
         stats.startedAt = data.startedAt || stats.startedAt;
         stats.totalRequests = data.totalRequests || 0;
-        stats.requestsToday = data.requestsToday || 0;
+        // requestsToday is only meaningful if the file was saved today;
+        // otherwise a restart the next morning would carry yesterday's count
+        // forward (lastResetDate starts as today, so trackRequest would never
+        // reset it).
+        stats.requestsToday = data.day === getToday() ? data.requestsToday || 0 : 0;
         stats.requestsByModel = data.requestsByModel || {};
         stats.lastRequestAt = data.lastRequestAt || null;
         stats.errorCount = data.errorCount || 0;
@@ -159,5 +166,6 @@ module.exports = {
   getUsage,
   resetUsage,
   saveUsage,
+  estimateTokens,
   extractTextFromMessages,
 };

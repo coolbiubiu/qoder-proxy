@@ -263,7 +263,7 @@ With `PROXY_API_KEY` set, `/v1/*` and `/usage/*` require the key; `/health` does
 | POST | `/v1/messages` | Yes | Anthropic-compatible chat with tool_use field adaptation |
 | POST | `/v1/messages/count_tokens` | Yes | Token estimation |
 | GET | `/usage/local` | Yes | Local usage estimate |
-| GET | `/usage/recent` | Yes | Recent request history (in-memory ring buffer, not persisted) |
+| GET | `/usage/recent` | Yes | Recent request history (persisted in SQLite `proxy.db`, capped by `HISTORY_LIMIT`) |
 | POST | `/usage/reset-local` | Yes | Reset local usage statistics and request history |
 
 ## Reasoning Options

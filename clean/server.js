@@ -1,12 +1,17 @@
 const { createApp } = require('./app');
 const { log } = require('./logger');
 const { isProxyAuthEnabled } = require('./auth');
-const { getCliBackend, shutdownCliProcesses } = require('./qodercn-cli');
+const { getCliBackend, shutdownCliProcesses, cleanupStalePromptAttachments } = require('./qodercn-cli');
+const { saveUsage } = require('./usage');
+const { closeRequestHistoryDb } = require('./request-history');
 
 const HOST = '127.0.0.1';
 const PORT = Number(process.env.PORT || 3000);
 
 const app = createApp();
+
+// Remove prompt attachments left behind by crashed/killed previous runs.
+cleanupStalePromptAttachments();
 
 const server = app.listen(PORT, HOST, () => {
   const backend = getCliBackend();
@@ -41,7 +46,11 @@ function shutdown(signal) {
   shuttingDown = true;
   log(`[server] ${signal} received, shutting down gracefully`);
   shutdownCliProcesses();
+  saveUsage();
   server.close(() => {
+    // Close the history DB only after in-flight requests have drained, so
+    // their final recordOutcome writes still land on disk.
+    closeRequestHistoryDb();
     log('[server] HTTP server closed');
     process.exit(0);
   });

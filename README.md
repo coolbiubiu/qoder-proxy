@@ -333,7 +333,7 @@ http://127.0.0.1:3000/ui
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/usage/local` | 返回本地用量统计 |
-| GET | `/usage/recent` | 返回最近请求记录（时间、端点、模型、状态、耗时），条数上限由 `HISTORY_LIMIT` 控制，默认 100 |
+| GET | `/usage/recent` | 返回最近请求记录（时间、端点、模型、状态、耗时），持久化在 SQLite 数据库 `proxy.db`（项目根目录），条数上限由 `HISTORY_LIMIT` 控制，默认 100 |
 | POST | `/usage/reset-local` | 重置本地用量统计与请求记录 |
 
 ## 许可证

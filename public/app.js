@@ -182,24 +182,50 @@ function loadDashboard() {
           '</div>' +
           '<div class="glass stat-item">' +
             '<div class="stat-label">Uptime</div>' +
-            '<div class="stat-value">' + escapeHtml(formatUptime(health.uptime)) + '</div>' +
+            '<div class="stat-value" id="dashboard-uptime">' + escapeHtml(formatUptime(health.uptime)) + '</div>' +
           '</div>' +
           '<div class="glass stat-item">' +
             '<div class="stat-label">CLI Slots</div>' +
-            '<div class="stat-value">' + escapeHtml(slotText) + '</div>' +
+            '<div class="stat-value" id="dashboard-slots">' + escapeHtml(slotText) + '</div>' +
           '</div>' +
           '<div class="glass stat-item">' +
             '<div class="stat-label">Base URL</div>' +
-            '<div class="stat-value muted">127.0.0.1:3000</div>' +
+            '<div class="stat-value muted">' + escapeHtml(window.location.host) + '</div>' +
           '</div>' +
         '</div>' +
-        '<div class="alert info">Local protocol adapter running. Access the Web UI at <code>http://127.0.0.1:3000/ui</code></div>';
+        '<div class="alert info">Local protocol adapter running. Access the Web UI at <code>' + escapeHtml(window.location.origin + '/ui') + '</code></div>';
       container.dataset.loaded = '1';
+      startDashboardRefresh();
     })
     .catch(function (err) {
       container.innerHTML =
         '<div class="alert error">Failed to load dashboard: ' + escapeHtml(err.message) + '</div>';
     });
+}
+
+// Uptime and slot occupancy move while the server runs, so keep those two
+// tiles fresh instead of showing a stale snapshot from first load.
+var dashboardRefreshTimer = null;
+
+function startDashboardRefresh() {
+  if (dashboardRefreshTimer) clearInterval(dashboardRefreshTimer);
+  dashboardRefreshTimer = setInterval(function () {
+    var dashboard = document.getElementById('dashboard');
+    if (!dashboard || !dashboard.classList.contains('active')) return;
+    api('/health')
+      .then(function (health) {
+        var uptimeEl = document.getElementById('dashboard-uptime');
+        var slotsEl = document.getElementById('dashboard-slots');
+        if (uptimeEl) uptimeEl.textContent = formatUptime(health.uptime);
+        if (slotsEl && health.slots) {
+          var slotMax = health.slots.max === null || health.slots.max === undefined ? '∞' : health.slots.max;
+          slotsEl.textContent =
+            (health.slots.active || 0) + ' / ' + slotMax +
+            ((health.slots.queued || 0) > 0 ? ' (+' + health.slots.queued + ' queued)' : '');
+        }
+      })
+      .catch(function () {});
+  }, 15000);
 }
 
 // ─── Models ────────────────────────────────────────────────────────────────────
@@ -472,6 +498,12 @@ function loadUsage() {
           var statusHtml = r.ok
             ? '<span style="color:var(--success)">OK</span>'
             : '<span style="color:var(--danger,#f66)">' + escapeHtml(r.error || 'error') + '</span>';
+          var modeHtml = r.stream
+            ? '<span style="color:var(--text-secondary)">stream</span>'
+            : '<span style="color:var(--text-secondary)">buffered</span>';
+          var tokensHtml = (r.inputTokens || r.outputTokens)
+            ? (r.inputTokens || 0) + ' / ' + (r.outputTokens || 0)
+            : '-';
           return (
             '<tr>' +
               '<td>' + escapeHtml(new Date(r.ts).toLocaleTimeString()) + '</td>' +
@@ -479,12 +511,18 @@ function loadUsage() {
               '<td><code>' + escapeHtml(r.model || '') + '</code></td>' +
               '<td>' + statusHtml + '</td>' +
               '<td>' + (r.ms || 0) + ' ms</td>' +
+              '<td>' + modeHtml + '</td>' +
+              '<td>' + (r.toolCount || 0) + '</td>' +
+              '<td>' + tokensHtml + '</td>' +
+              '<td>' + (r.messageCount != null ? r.messageCount : '-') + '</td>' +
+              '<td>' + (r.reasoningEffort != null ? escapeHtml(String(r.reasoningEffort)) : '-') + '</td>' +
             '</tr>'
           );
         }).join('');
         recentRows =
           '<div class="glass card" style="padding:0;overflow:hidden;">' +
             '<h3 style="padding:0.75rem 1rem 0;font-size:0.8125rem;color:var(--text-secondary)">Recent Requests</h3>' +
+            '<div style="overflow-x:auto;">' +
             '<table>' +
               '<thead><tr>' +
                 '<th style="padding:0.75rem 1rem">Time</th>' +
@@ -492,9 +530,15 @@ function loadUsage() {
                 '<th style="padding:0.75rem 1rem">Model</th>' +
                 '<th style="padding:0.75rem 1rem">Status</th>' +
                 '<th style="padding:0.75rem 1rem">Latency</th>' +
+                '<th style="padding:0.75rem 1rem">Mode</th>' +
+                '<th style="padding:0.75rem 1rem">Tools</th>' +
+                '<th style="padding:0.75rem 1rem">Tokens (in/out)</th>' +
+                '<th style="padding:0.75rem 1rem">Msgs</th>' +
+                '<th style="padding:0.75rem 1rem">Effort</th>' +
               '</tr></thead>' +
               '<tbody>' + rowsHtml + '</tbody>' +
             '</table>' +
+            '</div>' +
           '</div>';
       }
 

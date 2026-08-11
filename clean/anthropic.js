@@ -1,5 +1,13 @@
+const crypto = require('crypto');
 const { AppError } = require('./errors');
 const { generateCallId, normalizeAnthropicTools, buildToolSystemPrompt } = require('./tool-parser');
+const { estimateTokens } = require('./usage');
+
+// Millisecond timestamps collide under concurrency, so add randomness to keep
+// message IDs unique.
+function makeMessageId() {
+  return `msg_${Date.now().toString(36)}${crypto.randomBytes(6).toString('hex')}`;
+}
 
 function normalizeAnthropicText(content) {
   if (content == null) return '';
@@ -86,7 +94,7 @@ function anthropicToOpenAiMessages(body) {
   return { messages, tools };
 }
 
-function createAnthropicMessage({ model, content, parsedOutput }) {
+function createAnthropicMessage({ model, content, parsedOutput, inputTokens = 0 }) {
   // If the CLI output was parsed as tool calls, return Anthropic tool_use format
   if (parsedOutput && parsedOutput.type === 'tool_calls') {
     const contentBlocks = [];
@@ -108,7 +116,7 @@ function createAnthropicMessage({ model, content, parsedOutput }) {
     }
 
     return {
-      id: `msg_${Date.now()}`,
+      id: makeMessageId(),
       type: 'message',
       role: 'assistant',
       model,
@@ -116,15 +124,17 @@ function createAnthropicMessage({ model, content, parsedOutput }) {
       stop_reason: 'tool_use',
       stop_sequence: null,
       usage: {
-        input_tokens: 0,
-        output_tokens: 0,
+        input_tokens: inputTokens,
+        output_tokens: estimateTokens(
+          (parsedOutput.prefixText || '') + JSON.stringify(parsedOutput.toolCalls)
+        ),
       },
     };
   }
 
   // Regular text response
   return {
-    id: `msg_${Date.now()}`,
+    id: makeMessageId(),
     type: 'message',
     role: 'assistant',
     model,
@@ -132,8 +142,8 @@ function createAnthropicMessage({ model, content, parsedOutput }) {
     stop_reason: 'end_turn',
     stop_sequence: null,
     usage: {
-      input_tokens: 0,
-      output_tokens: 0,
+      input_tokens: inputTokens,
+      output_tokens: estimateTokens(content),
     },
   };
 }
@@ -144,7 +154,7 @@ function writeAnthropicSse(res, event, payload) {
 }
 
 function writeAnthropicMessageStream(res, { model, content, parsedOutput }) {
-  const id = `msg_${Date.now()}`;
+  const id = makeMessageId();
   const isToolCalls = parsedOutput && parsedOutput.type === 'tool_calls';
 
   res.status(200);

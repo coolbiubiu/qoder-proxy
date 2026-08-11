@@ -13,6 +13,7 @@ if (!/^(1|true|yes)$/i.test(process.env.QODER_PROXY_SKIP_DOTENV || '')) {
 
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const { anthropicError, openAiError, AppError } = require('./errors');
 const { apiKeyGuard, isAllowedOrigin, localOnlyGuard } = require('./auth');
 const { log } = require('./logger');
@@ -33,7 +34,7 @@ const {
   normalizeAnthropicTools,
   formatToolResultForPrompt,
 } = require('./tool-parser');
-const { trackRequest, getUsage, resetUsage, saveUsage, extractTextFromMessages } = require('./usage');
+const { trackRequest, getUsage, resetUsage, saveUsage, estimateTokens, extractTextFromMessages } = require('./usage');
 const { executeToolCall } = require('./tools-executor');
 const { recordRequestEntry, getRecentRequests, resetRequestHistory } = require('./request-history');
 const { getCliSlotStatus } = require('./concurrency');
@@ -65,14 +66,33 @@ function parseTimeoutOverrideHeader(req) {
 }
 
 // Mirror aggregate usage tracking with a per-request history entry for the
-// web console's Recent Requests panel.
-function recordOutcome(endpoint, model, isError, started, errorCode) {
+// web console's Recent Requests panel. `details` carries optional request
+// shape fields: stream, toolCount, messageCount, inputTokens, outputTokens,
+// toolCallDepth, reasoningEffort, status.
+function recordOutcome({ endpoint, model, isError, started, errorCode, ...details }) {
   recordRequestEntry({
     endpoint,
     model,
     ok: !isError,
     ms: Date.now() - started,
     error: isError ? errorCode || 'internal_error' : undefined,
+    ...details,
+  });
+}
+
+// Millisecond timestamps collide under concurrency, so add randomness to keep
+// completion/message IDs unique.
+function makeCompletionId(prefix = 'chatcmpl-') {
+  return `${prefix}${Date.now().toString(36)}${crypto.randomBytes(6).toString('hex')}`;
+}
+
+// Node 17 removed the request 'aborted' event; the response 'close' event
+// fires on every disconnect, so treat it as a cancellation only when we
+// haven't finished writing yet. Without this, a client that hangs up leaves
+// the CLI child running until its timeout while holding a slot.
+function abortOnDisconnect(req, res, controller) {
+  res.on('close', () => {
+    if (!res.writableEnded) controller.abort();
   });
 }
 
@@ -246,11 +266,14 @@ function extractRequestOptions(body) {
   };
 }
 
-function createChatCompletion({ model, content, parsedOutput }) {
+function createChatCompletion({ model, content, parsedOutput, inputTokens = 0 }) {
   // If the CLI output was parsed as tool calls, return OpenAI tool_calls format
   if (parsedOutput && parsedOutput.type === 'tool_calls') {
+    const completionTokens = estimateTokens(
+      (parsedOutput.prefixText || '') + JSON.stringify(parsedOutput.toolCalls)
+    );
     return {
-      id: `chatcmpl-${Date.now()}`,
+      id: makeCompletionId(),
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
       model,
@@ -274,16 +297,17 @@ function createChatCompletion({ model, content, parsedOutput }) {
         },
       ],
       usage: {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
+        prompt_tokens: inputTokens,
+        completion_tokens: completionTokens,
+        total_tokens: inputTokens + completionTokens,
       },
     };
   }
 
   // Regular text response
+  const completionTokens = estimateTokens(content);
   return {
-    id: `chatcmpl-${Date.now()}`,
+    id: makeCompletionId(),
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
     model,
@@ -298,9 +322,9 @@ function createChatCompletion({ model, content, parsedOutput }) {
       },
     ],
     usage: {
-      prompt_tokens: 0,
-      completion_tokens: 0,
-      total_tokens: 0,
+      prompt_tokens: inputTokens,
+      completion_tokens: completionTokens,
+      total_tokens: inputTokens + completionTokens,
     },
   };
 }
@@ -310,7 +334,7 @@ function writeSse(res, payload) {
 }
 
 function writeChatCompletionStream(res, { model, content, parsedOutput }) {
-  const id = `chatcmpl-${Date.now()}`;
+  const id = makeCompletionId();
   const created = Math.floor(Date.now() / 1000);
   const isToolCalls = parsedOutput && parsedOutput.type === 'tool_calls';
 
@@ -474,7 +498,7 @@ function createApp() {
   app.post(['/v1/chat/completions', '/chat/completions', '/v1/v1/chat/completions'], async (req, res) => {
     const started = Date.now();
     const controller = new AbortController();
-    req.on('aborted', () => controller.abort());
+    abortOnDisconnect(req, res, controller);
 
     try {
       validateChatRequest(req.body);
@@ -483,6 +507,17 @@ function createApp() {
       const timeoutOverride = parseTimeoutOverrideHeader(req);
       const tools = Array.isArray(req.body.tools) ? req.body.tools : null;
       const normalizedTools = tools ? normalizeOpenAiTools(tools) : null;
+      // Extract the input text once — usage tracking and the history row
+      // both need it, and re-joining every message at each call site wastes
+      // cycles on large conversations.
+      const inputText = extractTextFromMessages(req.body.messages);
+      // Request-shape details recorded in the per-request history row.
+      const requestDetails = {
+        messageCount: req.body.messages.length,
+        toolCount: normalizedTools ? normalizedTools.length : 0,
+        inputTokens: estimateTokens(inputText),
+        reasoningEffort: requestOptions.reasoningEffort,
+      };
       log('chat request accepted', {
         model,
         message_count: req.body.messages.length,
@@ -496,7 +531,7 @@ function createApp() {
       // tool-call JSON block that must be parsed and returned as structured
       // tool_calls, so those requests go through the buffered path below.
       if (req.body.stream && !normalizedTools) {
-        const id = `chatcmpl-${Date.now()}`;
+        const id = makeCompletionId();
         const created = Math.floor(Date.now() / 1000);
 
         res.status(200);
@@ -542,6 +577,22 @@ function createApp() {
             duration_ms: Date.now() - started,
             message: streamError.message,
           });
+          trackRequest({
+            model,
+            inputText,
+            outputText: '',
+            isError: true,
+          });
+          recordOutcome({
+            endpoint: 'chat',
+            model,
+            isError: true,
+            started,
+            errorCode: streamError.code,
+            stream: true,
+            status: streamError.status,
+            ...requestDetails,
+          });
           // Headers are already sent — surface the error as an SSE event so
           // clients render a failure instead of a silent empty message.
           if (!res.writableEnded) {
@@ -572,11 +623,20 @@ function createApp() {
         log('chat stream completed', { duration_ms: Date.now() - started });
         trackRequest({
           model,
-          inputText: extractTextFromMessages(req.body.messages),
+          inputText,
           outputText: chatStreamText || '',
           isError: false,
         });
-        recordOutcome('chat', model, false, started);
+        recordOutcome({
+          endpoint: 'chat',
+          model,
+          isError: false,
+          started,
+          stream: true,
+          status: 200,
+          outputTokens: estimateTokens(chatStreamText || ''),
+          ...requestDetails,
+        });
         return;
       }
 
@@ -599,16 +659,31 @@ function createApp() {
         // proper SSE stream, including delta.tool_calls when applicable.
         writeChatCompletionStream(res, { model, content: finalContent, parsedOutput: finalParsedOutput });
       } else {
-        res.json(createChatCompletion({ model, content: finalContent, parsedOutput: finalParsedOutput }));
+        res.json(createChatCompletion({
+          model,
+          content: finalContent,
+          parsedOutput: finalParsedOutput,
+          inputTokens: requestDetails.inputTokens,
+        }));
       }
       log('chat request completed', { duration_ms: Date.now() - started, tool_call_depth: toolCallDepth });
       trackRequest({
         model,
-        inputText: extractTextFromMessages(req.body.messages),
+        inputText,
         outputText: finalContent || '',
         isError: false,
       });
-      recordOutcome('chat', model, false, started);
+      recordOutcome({
+        endpoint: 'chat',
+        model,
+        isError: false,
+        started,
+        stream: Boolean(req.body.stream),
+        status: 200,
+        outputTokens: estimateTokens(finalContent || ''),
+        toolCallDepth,
+        ...requestDetails,
+      });
     } catch (error) {
       log('chat request failed', {
         code: error.code || 'internal_error',
@@ -622,7 +697,15 @@ function createApp() {
         outputText: '',
         isError: true,
       });
-      recordOutcome('chat', req.body?.model || MODEL_ID, true, started, error.code);
+      recordOutcome({
+        endpoint: 'chat',
+        model: req.body?.model || MODEL_ID,
+        isError: true,
+        started,
+        errorCode: error.code,
+        status: error.status,
+        messageCount: req.body?.messages?.length ?? null,
+      });
       if (!res.headersSent && !res.writableEnded) openAiError(res, error);
     }
   });
@@ -630,7 +713,7 @@ function createApp() {
   app.post(['/v1/messages', '/messages', '/v1/v1/messages'], async (req, res) => {
     const started = Date.now();
     const controller = new AbortController();
-    req.on('aborted', () => controller.abort());
+    abortOnDisconnect(req, res, controller);
 
     try {
       validateAnthropicMessagesRequest(req.body);
@@ -638,6 +721,15 @@ function createApp() {
       const requestOptions = extractRequestOptions(req.body);
       const timeoutOverride = parseTimeoutOverrideHeader(req);
       const { messages, tools } = anthropicToOpenAiMessages(req.body);
+      // Same as the chat handler: extract once, reuse everywhere.
+      const inputText = extractTextFromMessages(req.body.messages);
+      // Request-shape details recorded in the per-request history row.
+      const requestDetails = {
+        messageCount: req.body.messages.length,
+        toolCount: Array.isArray(tools) ? tools.length : 0,
+        inputTokens: estimateTokens(inputText),
+        reasoningEffort: requestOptions.reasoningEffort,
+      };
       log('anthropic message request accepted', {
         model,
         message_count: req.body.messages.length,
@@ -651,7 +743,7 @@ function createApp() {
       // tool-call JSON block that must be parsed and returned as structured
       // tool_use blocks, so those requests go through the buffered path below.
       if (req.body.stream && !(tools && tools.length)) {
-        const msgId = `msg_${Date.now()}`;
+        const msgId = makeCompletionId('msg_');
 
         res.status(200);
         res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
@@ -704,6 +796,22 @@ function createApp() {
             duration_ms: Date.now() - started,
             message: streamError.message,
           });
+          trackRequest({
+            model,
+            inputText,
+            outputText: '',
+            isError: true,
+          });
+          recordOutcome({
+            endpoint: 'anthropic',
+            model,
+            isError: true,
+            started,
+            errorCode: streamError.code,
+            stream: true,
+            status: streamError.status,
+            ...requestDetails,
+          });
           // Headers are already sent — surface the error as an SSE error
           // event so clients render a failure instead of an empty message.
           if (!res.writableEnded) {
@@ -735,11 +843,20 @@ function createApp() {
         log('anthropic stream completed', { duration_ms: Date.now() - started });
         trackRequest({
           model,
-          inputText: extractTextFromMessages(req.body.messages),
+          inputText,
           outputText: anthropicStreamText || '',
           isError: false,
         });
-        recordOutcome('anthropic', model, false, started);
+        recordOutcome({
+          endpoint: 'anthropic',
+          model,
+          isError: false,
+          started,
+          stream: true,
+          status: 200,
+          outputTokens: estimateTokens(anthropicStreamText || ''),
+          ...requestDetails,
+        });
         return;
       }
 
@@ -762,16 +879,31 @@ function createApp() {
         // proper SSE stream, including tool_use blocks when applicable.
         writeAnthropicMessageStream(res, { model, content: anthropicContent, parsedOutput: anthropicParsedOutput });
       } else {
-        res.json(createAnthropicMessage({ model, content: anthropicContent, parsedOutput: anthropicParsedOutput }));
+        res.json(createAnthropicMessage({
+          model,
+          content: anthropicContent,
+          parsedOutput: anthropicParsedOutput,
+          inputTokens: requestDetails.inputTokens,
+        }));
       }
       log('anthropic message request completed', { duration_ms: Date.now() - started, tool_call_depth: anthropicToolDepth });
       trackRequest({
         model,
-        inputText: extractTextFromMessages(req.body.messages),
+        inputText,
         outputText: anthropicContent || '',
         isError: false,
       });
-      recordOutcome('anthropic', model, false, started);
+      recordOutcome({
+        endpoint: 'anthropic',
+        model,
+        isError: false,
+        started,
+        stream: Boolean(req.body.stream),
+        status: 200,
+        outputTokens: estimateTokens(anthropicContent || ''),
+        toolCallDepth: anthropicToolDepth,
+        ...requestDetails,
+      });
     } catch (error) {
       log('anthropic message request failed', {
         code: error.code || 'internal_error',
@@ -785,7 +917,15 @@ function createApp() {
         outputText: '',
         isError: true,
       });
-      recordOutcome('anthropic', req.body?.model || MODEL_ID, true, started, error.code);
+      recordOutcome({
+        endpoint: 'anthropic',
+        model: req.body?.model || MODEL_ID,
+        isError: true,
+        started,
+        errorCode: error.code,
+        status: error.status,
+        messageCount: req.body?.messages?.length ?? null,
+      });
       if (!res.headersSent && !res.writableEnded) anthropicError(res, error);
     }
   });
@@ -804,7 +944,13 @@ function createApp() {
   });
 
   app.get('/usage/recent', (req, res) => {
-    const limit = Number(req.query.limit);
+    let limit;
+    if (req.query.limit !== undefined) {
+      limit = Number(req.query.limit);
+      if (!Number.isInteger(limit) || limit <= 0) {
+        throw new AppError(400, 'invalid_limit', 'limit must be a positive integer.');
+      }
+    }
     res.json({ requests: getRecentRequests(limit) });
   });
 

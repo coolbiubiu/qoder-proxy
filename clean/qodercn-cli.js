@@ -208,15 +208,7 @@ function extractAssistantContent(stdout) {
   throw new AppError(502, 'empty_upstream_output', 'Qoder CN CLI returned no assistant content.');
 }
 
-function ensureRuntimeHome(rootDir) {
-  const runtimeHome = path.join(rootDir, '.runtime', 'qodercn-home');
-  fs.mkdirSync(path.join(runtimeHome, 'AppData', 'Roaming'), { recursive: true });
-  fs.mkdirSync(path.join(runtimeHome, 'AppData', 'Local'), { recursive: true });
-  return runtimeHome;
-}
-
-function buildChildEnv(rootDir, token, backend) {
-  ensureRuntimeHome(rootDir);
+function buildChildEnv(token, backend) {
   const cfg = backend || getCliBackend();
   // Don't override HOME/USERPROFILE — let the CLI find its auth config
   // in the real home directory (same as running the CLI directly).
@@ -388,6 +380,32 @@ function createPromptAttachment(rootDir, prompt) {
   return filePath;
 }
 
+// A crashed or kill -9'd run never reaches finish(), so its attachment file
+// stays behind. Sweep anything older than an hour on startup so
+// .runtime/prompts cannot grow unbounded.
+const STALE_ATTACHMENT_MS = 60 * 60 * 1000;
+
+function cleanupStalePromptAttachments(rootDir = process.cwd()) {
+  const promptDir = path.join(rootDir, '.runtime', 'prompts');
+  let names;
+  try {
+    names = fs.readdirSync(promptDir);
+  } catch (_) {
+    // Directory does not exist yet — nothing to clean.
+    return;
+  }
+  const cutoff = Date.now() - STALE_ATTACHMENT_MS;
+  for (const name of names) {
+    if (!name.startsWith('prompt-')) continue;
+    const filePath = path.join(promptDir, name);
+    try {
+      if (fs.statSync(filePath).mtimeMs < cutoff) fs.rmSync(filePath, { force: true });
+    } catch (_) {
+      // Individual file failures must not block startup.
+    }
+  }
+}
+
 /**
  * Gather everything both run modes need before spawning: backend config,
  * token check, prompt construction, CLI args and the final spawn spec.
@@ -448,7 +466,7 @@ function prepareCliInvocation({
   });
   const spawnSpec = buildSpawnCommand(command, args, backend);
   const finalArgs = fixLongAppendSystemPrompt(spawnSpec.args, attachmentPath, spawnSpec.command);
-  const env = buildChildEnv(rootDir, token, backend);
+  const env = buildChildEnv(token, backend);
 
   return {
     backend,
@@ -724,6 +742,7 @@ module.exports = {
   buildCliArgs,
   buildPrompt,
   buildSpawnCommand,
+  cleanupStalePromptAttachments,
   createPromptAttachment,
   extractAssistantContent,
   extractStreamDelta,
