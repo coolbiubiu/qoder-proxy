@@ -157,10 +157,14 @@ function loadDashboard() {
   Promise.all([api('/'), api('/health'), api('/v1/models')])
     .then(function (data) {
       var info = data[0];
+      var health = data[1];
       var models = data[2];
       var modelCount = models.data ? models.data.length : 0;
 
       var backendName = info.cli_backend === 'global' ? 'Global (qodercli)' : 'CN (qoderclicn)';
+      var slots = health.slots || {};
+      var slotMax = slots.max === null || slots.max === undefined ? '∞' : slots.max;
+      var slotText = (slots.active || 0) + ' / ' + slotMax + ((slots.queued || 0) > 0 ? ' (+' + slots.queued + ' queued)' : '');
 
       container.innerHTML =
         '<div class="stat-grid">' +
@@ -175,6 +179,14 @@ function loadDashboard() {
           '<div class="glass stat-item">' +
             '<div class="stat-label">Models</div>' +
             '<div class="stat-value">' + modelCount + '</div>' +
+          '</div>' +
+          '<div class="glass stat-item">' +
+            '<div class="stat-label">Uptime</div>' +
+            '<div class="stat-value">' + escapeHtml(formatUptime(health.uptime)) + '</div>' +
+          '</div>' +
+          '<div class="glass stat-item">' +
+            '<div class="stat-label">CLI Slots</div>' +
+            '<div class="stat-value">' + escapeHtml(slotText) + '</div>' +
           '</div>' +
           '<div class="glass stat-item">' +
             '<div class="stat-label">Base URL</div>' +
@@ -424,6 +436,13 @@ function loadUsage() {
 
   api('/usage/local')
     .then(function (data) {
+      return api('/usage/recent?limit=20').catch(function () { return { requests: [] }; }).then(function (recent) {
+        return { data: data, recent: (recent && recent.requests) || [] };
+      });
+    })
+    .then(function (result) {
+      var data = result.data;
+      var recent = result.recent;
       var modelRows = '';
       if (data.requestsByModel && Object.keys(data.requestsByModel).length > 0) {
         var rows = Object.keys(data.requestsByModel).map(function (model) {
@@ -446,6 +465,38 @@ function loadUsage() {
       var lastReq = data.lastRequestAt
         ? new Date(data.lastRequestAt).toLocaleString()
         : 'Never';
+
+      var recentRows = '';
+      if (recent.length > 0) {
+        var rowsHtml = recent.map(function (r) {
+          var statusHtml = r.ok
+            ? '<span style="color:var(--success)">OK</span>'
+            : '<span style="color:var(--danger,#f66)">' + escapeHtml(r.error || 'error') + '</span>';
+          return (
+            '<tr>' +
+              '<td>' + escapeHtml(new Date(r.ts).toLocaleTimeString()) + '</td>' +
+              '<td><code>' + escapeHtml(r.endpoint || '') + '</code></td>' +
+              '<td><code>' + escapeHtml(r.model || '') + '</code></td>' +
+              '<td>' + statusHtml + '</td>' +
+              '<td>' + (r.ms || 0) + ' ms</td>' +
+            '</tr>'
+          );
+        }).join('');
+        recentRows =
+          '<div class="glass card" style="padding:0;overflow:hidden;">' +
+            '<h3 style="padding:0.75rem 1rem 0;font-size:0.8125rem;color:var(--text-secondary)">Recent Requests</h3>' +
+            '<table>' +
+              '<thead><tr>' +
+                '<th style="padding:0.75rem 1rem">Time</th>' +
+                '<th style="padding:0.75rem 1rem">Endpoint</th>' +
+                '<th style="padding:0.75rem 1rem">Model</th>' +
+                '<th style="padding:0.75rem 1rem">Status</th>' +
+                '<th style="padding:0.75rem 1rem">Latency</th>' +
+              '</tr></thead>' +
+              '<tbody>' + rowsHtml + '</tbody>' +
+            '</table>' +
+          '</div>';
+      }
 
       container.innerHTML =
         '<div class="alert warning">These are <strong>local estimates only</strong>. They do not represent official Qoder billing or remaining quota.</div>' +
@@ -489,6 +540,8 @@ function loadUsage() {
 
         modelRows +
 
+        recentRows +
+
         '<button class="btn danger" id="reset-usage-btn">Reset Local Stats</button>';
       container.dataset.loaded = '1';
 
@@ -514,6 +567,16 @@ function resetUsage() {
 }
 
 // ─── Utilities ─────────────────────────────────────────────────────────────────
+
+function formatUptime(seconds) {
+  if (!seconds && seconds !== 0) return '-';
+  var h = Math.floor(seconds / 3600);
+  var m = Math.floor((seconds % 3600) / 60);
+  var s = Math.floor(seconds % 60);
+  if (h > 0) return h + 'h ' + m + 'm';
+  if (m > 0) return m + 'm ' + s + 's';
+  return s + 's';
+}
 
 function escapeHtml(text) {
   if (!text) return '';

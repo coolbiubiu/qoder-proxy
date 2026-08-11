@@ -117,7 +117,11 @@ function resetUsage() {
 function saveUsage() {
   try {
     const data = JSON.stringify(getUsage(), null, 2);
-    fs.writeFileSync(USAGE_FILE, data, 'utf8');
+    // Write-then-rename so a crash mid-write can never leave a truncated
+    // usage.json behind (rename is atomic on the same filesystem).
+    const tmpFile = `${USAGE_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpFile, data, 'utf8');
+    fs.renameSync(tmpFile, USAGE_FILE);
   } catch (_) {
     // Silent fail
   }

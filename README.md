@@ -238,13 +238,14 @@ opencode run --model qoder-cn-local/qwen3.7-max --variant high "reply OK"
 
 | 方法 | 路径 | 需要密钥 | 说明 |
 |------|------|------|------|
-| GET | `/health` | 否 | 健康检查 |
+| GET | `/health` | 否 | 健康检查，含运行时长、后端、CLI 并发槽位状态 |
 | GET | `/v1/models` | 是 | 模型列表 |
 | POST | `/v1/chat/completions` | 是 | OpenAI 兼容格式对话，支持 tools 字段适配 |
 | POST | `/v1/messages` | 是 | Anthropic 兼容格式对话，支持 tool_use 字段适配 |
 | POST | `/v1/messages/count_tokens` | 是 | Token 估算 |
 | GET | `/usage/local` | 是 | 本地用量估算 |
-| POST | `/usage/reset-local` | 是 | 重置本地用量统计 |
+| GET | `/usage/recent` | 是 | 最近请求记录（内存环形缓冲，不落盘） |
+| POST | `/usage/reset-local` | 是 | 重置本地用量统计与请求记录 |
 
 ## 推理参数
 
@@ -257,6 +258,14 @@ $env:QODERCN_MAX_OUTPUT_TOKENS = "4096"
 ```
 
 也可在每次请求中通过 `reasoning_effort`、`context_window`、`max_tokens` 参数单独指定。
+
+单个请求还可通过请求头 `x-qoder-timeout: <秒>` 覆盖 CLI 超时（上限 600 秒），优先于 `QODERCN_TIMEOUT_MS`。
+
+## 并发控制
+
+每次请求都会启动一个 CLI 子进程。通过 `MAX_CONCURRENT_CLI` 限制同时运行的子进程数，超出的请求进入 FIFO 队列等待；`CLI_QUEUE_TIMEOUT_MS` 控制排队超时（超时返回 503）。`/health` 的 `slots` 字段可查看当前占用与排队情况。
+
+进程收到 `SIGINT`/`SIGTERM` 时会优雅关闭：停止接受新连接并终止在途的 CLI 子进程，避免遗留孤儿进程。
 
 ## 流式输出
 
@@ -305,11 +314,11 @@ http://127.0.0.1:3000/ui
 
 | Tab | 说明 |
 |-----|------|
-| Dashboard | 显示 /health 状态、Base URL、模型数量、安全状态 |
+| Dashboard | 显示 /health 状态、运行时长、CLI 槽位占用、Base URL、模型数量、安全状态 |
 | Models | 调用 /v1/models 显示模型列表 |
 | Chat Test | 用 /v1/chat/completions 做简单非流式测试 |
 | Config | 生成 OpenAI Compatible / Anthropic Compatible / OpenCode 配置示例 |
-| Usage / Credits | 本地用量统计 |
+| Usage / Credits | 本地用量统计 + 最近请求记录 |
 
 ### 本地用量统计说明
 
@@ -324,7 +333,8 @@ http://127.0.0.1:3000/ui
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/usage/local` | 返回本地用量统计 |
-| POST | `/usage/reset-local` | 重置本地用量统计 |
+| GET | `/usage/recent` | 返回最近请求记录（时间、端点、模型、状态、耗时），条数上限由 `HISTORY_LIMIT` 控制，默认 100 |
+| POST | `/usage/reset-local` | 重置本地用量统计与请求记录 |
 
 ## 许可证
 

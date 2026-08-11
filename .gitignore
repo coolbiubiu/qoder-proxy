@@ -9,3 +9,4 @@ dist/
 MAINTENANCE_LOCAL.md
 usage.json
 .qoder/
+proxy.log

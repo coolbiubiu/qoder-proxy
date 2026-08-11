@@ -255,7 +255,12 @@ test('/health stays open for liveness checks and leaks nothing', async () => {
     try {
       const health = await fetch(`${baseUrl}/health`);
       assert.equal(health.status, 200);
-      assert.deepEqual(await health.json(), { ok: true });
+      const body = await health.json();
+      assert.equal(body.ok, true);
+      // Liveness details are fine, but nothing sensitive may leak here.
+      const text = JSON.stringify(body);
+      assert.equal(text.includes(process.env.HOME || ''), false);
+      assert.equal(text.includes('sekret-key'), false);
     } finally {
       server.close();
     }

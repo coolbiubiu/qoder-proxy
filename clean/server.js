@@ -1,14 +1,14 @@
 const { createApp } = require('./app');
 const { log } = require('./logger');
 const { isProxyAuthEnabled } = require('./auth');
-const { getCliBackend } = require('./qodercn-cli');
+const { getCliBackend, shutdownCliProcesses } = require('./qodercn-cli');
 
 const HOST = '127.0.0.1';
 const PORT = Number(process.env.PORT || 3000);
 
 const app = createApp();
 
-app.listen(PORT, HOST, () => {
+const server = app.listen(PORT, HOST, () => {
   const backend = getCliBackend();
   log(`Qoder Proxy listening on http://${HOST}:${PORT}`);
   log('CLI backend', {
@@ -31,3 +31,22 @@ app.listen(PORT, HOST, () => {
     );
   }
 });
+
+// Graceful shutdown: stop accepting new connections, terminate in-flight CLI
+// child processes so they are not left orphaned, then exit. A hard deadline
+// forces exit if a connection refuses to drain.
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log(`[server] ${signal} received, shutting down gracefully`);
+  shutdownCliProcesses();
+  server.close(() => {
+    log('[server] HTTP server closed');
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(1), 5000).unref();
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));

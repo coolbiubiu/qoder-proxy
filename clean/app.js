@@ -1,4 +1,15 @@
-require('dotenv').config();
+const path = require('path');
+const dotenv = require('dotenv');
+
+// Prefer .env in the working directory; fall back to the project root next
+// to clean/ so running the bundle from elsewhere still finds the config.
+// QODER_PROXY_SKIP_DOTENV lets tests opt out of local .env entirely.
+if (!/^(1|true|yes)$/i.test(process.env.QODER_PROXY_SKIP_DOTENV || '')) {
+  const loaded = dotenv.config();
+  if (loaded.error) {
+    dotenv.config({ path: path.join(__dirname, '..', '.env') });
+  }
+}
 
 const express = require('express');
 const cors = require('cors');
@@ -22,9 +33,10 @@ const {
   normalizeAnthropicTools,
   formatToolResultForPrompt,
 } = require('./tool-parser');
-const path = require('path');
 const { trackRequest, getUsage, resetUsage, saveUsage, extractTextFromMessages } = require('./usage');
 const { executeToolCall } = require('./tools-executor');
+const { recordRequestEntry, getRecentRequests, resetRequestHistory } = require('./request-history');
+const { getCliSlotStatus } = require('./concurrency');
 
 const MODEL_ID = DEFAULT_MODEL_ID;
 
@@ -33,6 +45,141 @@ const MODEL_ID = DEFAULT_MODEL_ID;
 // must return tool_calls to the client instead of running them locally.
 function isServerToolExecutionEnabled() {
   return /^(1|true|yes)$/i.test(process.env.SERVER_TOOL_EXECUTION || '');
+}
+
+const MAX_TOOL_CALL_DEPTH = 10;
+
+// Clients can cap a single request's CLI runtime via the x-qoder-timeout
+// header (seconds); it may not exceed this ceiling so a rogue client cannot
+// pin a CLI slot forever.
+const MAX_TIMEOUT_OVERRIDE_SECONDS = 600;
+
+function parseTimeoutOverrideHeader(req) {
+  const raw = req.headers['x-qoder-timeout'];
+  if (raw === undefined || raw === '') return undefined;
+  const seconds = Number(raw);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    throw new AppError(400, 'invalid_timeout', 'x-qoder-timeout must be a positive number of seconds.');
+  }
+  return Math.min(seconds, MAX_TIMEOUT_OVERRIDE_SECONDS) * 1000;
+}
+
+// Mirror aggregate usage tracking with a per-request history entry for the
+// web console's Recent Requests panel.
+function recordOutcome(endpoint, model, isError, started, errorCode) {
+  recordRequestEntry({
+    endpoint,
+    model,
+    ok: !isError,
+    ms: Date.now() - started,
+    error: isError ? errorCode || 'internal_error' : undefined,
+  });
+}
+
+/**
+ * Run the CLI and, when server-side tool execution is enabled, loop tool
+ * results back in until the model stops calling tools. Shared by the OpenAI
+ * and Anthropic endpoints — both follow the identical protocol here.
+ */
+async function runCliWithToolLoop({
+  runCli,
+  messages,
+  model,
+  tools,
+  requestOptions,
+  maxOutputTokens,
+  timeoutOverride,
+  signal,
+  logPrefix,
+}) {
+  let workingMessages = [...messages];
+  let finalContent = '';
+  let finalParsedOutput = null;
+  let depth = 0;
+
+  while (depth < MAX_TOOL_CALL_DEPTH) {
+    const content = await runCli({
+      messages: workingMessages,
+      model,
+      tools,
+      reasoningEffort: requestOptions.reasoningEffort,
+      contextWindow: requestOptions.contextWindow,
+      maxOutputTokens,
+      timeoutOverride,
+      signal,
+    });
+
+    finalContent = content;
+
+    // Parse the output for tool calls if tools were provided
+    let parsedOutput = null;
+    if (tools) {
+      parsedOutput = parseToolCallOutput(content);
+      if (parsedOutput && parsedOutput.type === 'tool_calls') {
+        log(`${logPrefix} tool calls detected`, {
+          tool_count: parsedOutput.toolCalls.length,
+          tools: parsedOutput.toolCalls.map((t) => t.name),
+        });
+      } else {
+        log(`${logPrefix} no tool calls detected`, { response_type: parsedOutput?.type || 'text' });
+      }
+    }
+
+    finalParsedOutput = parsedOutput;
+
+    // If no tool calls, we're done
+    if (!parsedOutput || parsedOutput.type !== 'tool_calls') {
+      break;
+    }
+
+    // Default: hand tool_calls back to the client, which executes tools
+    // in its own workspace. Server-side execution only when opted in.
+    if (!isServerToolExecutionEnabled()) {
+      break;
+    }
+
+    // Execute tool calls and build tool result messages
+    const toolResults = [];
+    const assistantToolCalls = [];
+
+    for (const toolCall of parsedOutput.toolCalls) {
+      const callId = generateCallId('call_');
+      assistantToolCalls.push({
+        id: callId,
+        type: 'function',
+        function: {
+          name: toolCall.name,
+          arguments: JSON.stringify(toolCall.arguments || {}),
+        },
+      });
+
+      log(`executing ${logPrefix} tool`, { name: toolCall.name, arguments: toolCall.arguments });
+      const result = await executeToolCall(toolCall);
+      log(`${logPrefix} tool result`, { name: toolCall.name, result });
+
+      toolResults.push({
+        role: 'tool',
+        tool_call_id: callId,
+        content: JSON.stringify(result),
+      });
+    }
+
+    // Add assistant message with tool_calls, then the tool results
+    workingMessages.push({
+      role: 'assistant',
+      content: parsedOutput.prefixText || null,
+      tool_calls: assistantToolCalls,
+    });
+    workingMessages.push(...toolResults);
+
+    depth++;
+  }
+
+  if (depth >= MAX_TOOL_CALL_DEPTH) {
+    log(`warning: max ${logPrefix} tool call depth reached`, { depth: MAX_TOOL_CALL_DEPTH });
+  }
+
+  return { content: finalContent, parsedOutput: finalParsedOutput, toolCallDepth: depth };
 }
 
 function validateChatRequest(body) {
@@ -276,7 +423,17 @@ function createApp() {
   app.use(express.json({ limit: '1mb' }));
 
   app.get('/health', (_req, res) => {
-    res.json({ ok: true });
+    const slots = getCliSlotStatus();
+    res.json({
+      ok: true,
+      uptime: Math.floor(process.uptime()),
+      backend: qoderCli.getCliBackend().name,
+      slots: {
+        active: slots.active,
+        queued: slots.queued,
+        max: Number.isFinite(slots.maxConcurrency) ? slots.maxConcurrency : null,
+      },
+    });
   });
 
   app.get('/', (_req, res) => {
@@ -323,6 +480,7 @@ function createApp() {
       validateChatRequest(req.body);
       const model = req.body.model || MODEL_ID;
       const requestOptions = extractRequestOptions(req.body);
+      const timeoutOverride = parseTimeoutOverrideHeader(req);
       const tools = Array.isArray(req.body.tools) ? req.body.tools : null;
       const normalizedTools = tools ? normalizeOpenAiTools(tools) : null;
       log('chat request accepted', {
@@ -356,14 +514,16 @@ function createApp() {
           choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
         });
 
+        let chatStreamText = '';
         try {
-          await qoderCli.runQoderCnCliStream({
+          chatStreamText = await qoderCli.runQoderCnCliStream({
             messages: req.body.messages,
             model,
             tools: normalizedTools,
             reasoningEffort: requestOptions.reasoningEffort,
             contextWindow: requestOptions.contextWindow,
             maxOutputTokens: requestOptions.maxOutputTokens,
+            timeoutOverride,
             signal: controller.signal,
             onDelta: (delta) => {
               writeSse(res, {
@@ -413,102 +573,26 @@ function createApp() {
         trackRequest({
           model,
           inputText: extractTextFromMessages(req.body.messages),
-          outputText: '',
+          outputText: chatStreamText || '',
           isError: false,
         });
+        recordOutcome('chat', model, false, started);
         return;
       }
 
       // Non-streaming path (or tool calls with stream=true → downgraded)
-      // Build working messages for potential tool-call loops
-      let workingMessages = [...req.body.messages];
-      let finalContent = '';
-      let finalParsedOutput = null;
-      let toolCallDepth = 0;
-      const MAX_TOOL_CALL_DEPTH = 10;
-
-      while (toolCallDepth < MAX_TOOL_CALL_DEPTH) {
-        const content = await qoderCli.runQoderCnCli({
-          messages: workingMessages,
+      const { content: finalContent, parsedOutput: finalParsedOutput, toolCallDepth } =
+        await runCliWithToolLoop({
+          runCli: (options) => qoderCli.runQoderCnCli(options),
+          messages: req.body.messages,
           model,
           tools: normalizedTools,
-          reasoningEffort: requestOptions.reasoningEffort,
-          contextWindow: requestOptions.contextWindow,
+          requestOptions,
           maxOutputTokens: requestOptions.maxOutputTokens,
+          timeoutOverride,
           signal: controller.signal,
+          logPrefix: 'chat',
         });
-
-        finalContent = content;
-
-        // Parse the output for tool calls if tools were provided
-        let parsedOutput = null;
-        if (normalizedTools) {
-          parsedOutput = parseToolCallOutput(content);
-          if (parsedOutput && parsedOutput.type === 'tool_calls') {
-            log('chat tool calls detected', {
-              tool_count: parsedOutput.toolCalls.length,
-              tools: parsedOutput.toolCalls.map((t) => t.name),
-            });
-          } else {
-            log('chat no tool calls detected', { response_type: parsedOutput?.type || 'text' });
-          }
-        }
-
-        finalParsedOutput = parsedOutput;
-
-        // If no tool calls, we're done
-        if (!parsedOutput || parsedOutput.type !== 'tool_calls') {
-          break;
-        }
-
-        // Default: hand tool_calls back to the client, which executes tools
-        // in its own workspace. Server-side execution only when opted in.
-        if (!isServerToolExecutionEnabled()) {
-          break;
-        }
-
-        // Execute tool calls and build tool result messages
-        const toolResults = [];
-        const assistantToolCalls = [];
-
-        for (const toolCall of parsedOutput.toolCalls) {
-          const callId = generateCallId('call_');
-          assistantToolCalls.push({
-            id: callId,
-            type: 'function',
-            function: {
-              name: toolCall.name,
-              arguments: JSON.stringify(toolCall.arguments || {}),
-            },
-          });
-
-          log('executing tool', { name: toolCall.name, arguments: toolCall.arguments });
-          const result = await executeToolCall(toolCall);
-          log('tool result', { name: toolCall.name, result });
-
-          toolResults.push({
-            role: 'tool',
-            tool_call_id: callId,
-            content: JSON.stringify(result),
-          });
-        }
-
-        // Add assistant message with tool_calls
-        workingMessages.push({
-          role: 'assistant',
-          content: parsedOutput.prefixText || null,
-          tool_calls: assistantToolCalls,
-        });
-
-        // Add tool result messages
-        workingMessages.push(...toolResults);
-
-        toolCallDepth++;
-      }
-
-      if (toolCallDepth >= MAX_TOOL_CALL_DEPTH) {
-        log('warning: max tool call depth reached', { depth: MAX_TOOL_CALL_DEPTH });
-      }
 
       if (req.body.stream) {
         // Buffered request (tools declared) — emit the parsed result as a
@@ -524,6 +608,7 @@ function createApp() {
         outputText: finalContent || '',
         isError: false,
       });
+      recordOutcome('chat', model, false, started);
     } catch (error) {
       log('chat request failed', {
         code: error.code || 'internal_error',
@@ -537,6 +622,7 @@ function createApp() {
         outputText: '',
         isError: true,
       });
+      recordOutcome('chat', req.body?.model || MODEL_ID, true, started, error.code);
       if (!res.headersSent && !res.writableEnded) openAiError(res, error);
     }
   });
@@ -550,6 +636,7 @@ function createApp() {
       validateAnthropicMessagesRequest(req.body);
       const model = req.body.model || MODEL_ID;
       const requestOptions = extractRequestOptions(req.body);
+      const timeoutOverride = parseTimeoutOverrideHeader(req);
       const { messages, tools } = anthropicToOpenAiMessages(req.body);
       log('anthropic message request accepted', {
         model,
@@ -591,14 +678,16 @@ function createApp() {
           content_block: { type: 'text', text: '' },
         });
 
+        let anthropicStreamText = '';
         try {
-          await qoderCli.runQoderCnCliStream({
+          anthropicStreamText = await qoderCli.runQoderCnCliStream({
             messages,
             model,
             tools,
             reasoningEffort: requestOptions.reasoningEffort,
             contextWindow: requestOptions.contextWindow,
             maxOutputTokens: requestOptions.maxOutputTokens || req.body.max_tokens,
+            timeoutOverride,
             signal: controller.signal,
             onDelta: (delta) => {
               writeAnthropicSse(res, 'content_block_delta', {
@@ -647,102 +736,26 @@ function createApp() {
         trackRequest({
           model,
           inputText: extractTextFromMessages(req.body.messages),
-          outputText: '',
+          outputText: anthropicStreamText || '',
           isError: false,
         });
+        recordOutcome('anthropic', model, false, started);
         return;
       }
 
       // Non-streaming path (or tool calls with stream=true → downgraded)
-      // Build working messages for potential tool-call loops
-      let workingMessagesAnthropic = [...messages];
-      let anthropicContent = '';
-      let anthropicParsedOutput = null;
-      let anthropicToolDepth = 0;
-      const MAX_ANTHROPIC_TOOL_DEPTH = 10;
-
-      while (anthropicToolDepth < MAX_ANTHROPIC_TOOL_DEPTH) {
-        const content = await qoderCli.runQoderCnCli({
-          messages: workingMessagesAnthropic,
+      const { content: anthropicContent, parsedOutput: anthropicParsedOutput, toolCallDepth: anthropicToolDepth } =
+        await runCliWithToolLoop({
+          runCli: (options) => qoderCli.runQoderCnCli(options),
+          messages,
           model,
           tools,
-          reasoningEffort: requestOptions.reasoningEffort,
-          contextWindow: requestOptions.contextWindow,
+          requestOptions,
           maxOutputTokens: requestOptions.maxOutputTokens || req.body.max_tokens,
+          timeoutOverride,
           signal: controller.signal,
+          logPrefix: 'anthropic',
         });
-
-        anthropicContent = content;
-
-        // Parse the output for tool calls if tools were provided
-        let parsedOutput = null;
-        if (tools) {
-          parsedOutput = parseToolCallOutput(content);
-          if (parsedOutput && parsedOutput.type === 'tool_calls') {
-            log('anthropic tool calls detected', {
-              tool_count: parsedOutput.toolCalls.length,
-              tools: parsedOutput.toolCalls.map((t) => t.name),
-            });
-          } else {
-            log('anthropic no tool calls detected', { response_type: parsedOutput?.type || 'text' });
-          }
-        }
-
-        anthropicParsedOutput = parsedOutput;
-
-        // If no tool calls, we're done
-        if (!parsedOutput || parsedOutput.type !== 'tool_calls') {
-          break;
-        }
-
-        // Default: hand tool_use blocks back to the client, which executes
-        // tools in its own workspace. Server-side execution only when opted in.
-        if (!isServerToolExecutionEnabled()) {
-          break;
-        }
-
-        // Execute tool calls and build tool result messages
-        const toolResults = [];
-        const assistantToolCalls = [];
-
-        for (const toolCall of parsedOutput.toolCalls) {
-          const callId = generateCallId('call_');
-          assistantToolCalls.push({
-            id: callId,
-            type: 'function',
-            function: {
-              name: toolCall.name,
-              arguments: JSON.stringify(toolCall.arguments || {}),
-            },
-          });
-
-          log('executing anthropic tool', { name: toolCall.name, arguments: toolCall.arguments });
-          const result = await executeToolCall(toolCall);
-          log('anthropic tool result', { name: toolCall.name, result });
-
-          toolResults.push({
-            role: 'tool',
-            tool_call_id: callId,
-            content: JSON.stringify(result),
-          });
-        }
-
-        // Add assistant message with tool_calls
-        workingMessagesAnthropic.push({
-          role: 'assistant',
-          content: parsedOutput.prefixText || null,
-          tool_calls: assistantToolCalls,
-        });
-
-        // Add tool result messages
-        workingMessagesAnthropic.push(...toolResults);
-
-        anthropicToolDepth++;
-      }
-
-      if (anthropicToolDepth >= MAX_ANTHROPIC_TOOL_DEPTH) {
-        log('warning: max anthropic tool call depth reached', { depth: MAX_ANTHROPIC_TOOL_DEPTH });
-      }
 
       if (req.body.stream) {
         // Buffered request (tools declared) — emit the parsed result as a
@@ -758,6 +771,7 @@ function createApp() {
         outputText: anthropicContent || '',
         isError: false,
       });
+      recordOutcome('anthropic', model, false, started);
     } catch (error) {
       log('anthropic message request failed', {
         code: error.code || 'internal_error',
@@ -771,6 +785,7 @@ function createApp() {
         outputText: '',
         isError: true,
       });
+      recordOutcome('anthropic', req.body?.model || MODEL_ID, true, started, error.code);
       if (!res.headersSent && !res.writableEnded) anthropicError(res, error);
     }
   });
@@ -788,8 +803,14 @@ function createApp() {
     res.json(getUsage());
   });
 
+  app.get('/usage/recent', (req, res) => {
+    const limit = Number(req.query.limit);
+    res.json({ requests: getRecentRequests(limit) });
+  });
+
   app.post('/usage/reset-local', (_req, res) => {
     resetUsage();
+    resetRequestHistory();
     res.json({ ok: true });
   });
 

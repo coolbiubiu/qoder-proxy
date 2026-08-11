@@ -257,13 +257,14 @@ With `PROXY_API_KEY` set, `/v1/*` and `/usage/*` require the key; `/health` does
 
 | Method | Path | Key required | Description |
 |--------|------|------|-------------|
-| GET | `/health` | No | Health check |
+| GET | `/health` | No | Health check, incl. uptime, backend and CLI slot status |
 | GET | `/v1/models` | Yes | Model list |
 | POST | `/v1/chat/completions` | Yes | OpenAI-compatible chat with tools field adaptation |
 | POST | `/v1/messages` | Yes | Anthropic-compatible chat with tool_use field adaptation |
 | POST | `/v1/messages/count_tokens` | Yes | Token estimation |
 | GET | `/usage/local` | Yes | Local usage estimate |
-| POST | `/usage/reset-local` | Yes | Reset local usage statistics |
+| GET | `/usage/recent` | Yes | Recent request history (in-memory ring buffer, not persisted) |
+| POST | `/usage/reset-local` | Yes | Reset local usage statistics and request history |
 
 ## Reasoning Options
 
@@ -276,6 +277,14 @@ $env:QODERCN_MAX_OUTPUT_TOKENS = "4096"
 ```
 
 Or specify per request via `reasoning_effort`, `context_window`, and `max_tokens`.
+
+A single request may also override the CLI timeout with the `x-qoder-timeout: <seconds>` request header (capped at 600s), which wins over `QODERCN_TIMEOUT_MS`.
+
+## Concurrency Control
+
+Every request spawns a CLI child process. `MAX_CONCURRENT_CLI` caps how many run at once; extra requests wait in a FIFO queue, and `CLI_QUEUE_TIMEOUT_MS` controls queue wait timeout (503 on expiry). The `slots` field of `/health` shows current occupancy and queue depth.
+
+On `SIGINT`/`SIGTERM` the server shuts down gracefully: it stops accepting connections and terminates in-flight CLI child processes instead of leaving orphans behind.
 
 ## Streaming
 

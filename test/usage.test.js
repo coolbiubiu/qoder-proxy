@@ -187,7 +187,9 @@ test('Existing endpoints still work after adding usage routes', async () => {
     // Health
     const health = await fetch(`${baseUrl}/health`);
     assert.equal(health.status, 200);
-    assert.deepEqual(await health.json(), { ok: true });
+    const healthBody = await health.json();
+    assert.equal(healthBody.ok, true);
+    assert.ok(healthBody.slots);
 
     // Models
     const models = await fetch(`${baseUrl}/v1/models`);

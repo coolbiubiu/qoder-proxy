@@ -17,7 +17,12 @@ test('health and models endpoints are OpenAI-compatible enough for discovery', a
   try {
     const health = await fetch(`${baseUrl}/health`);
     assert.equal(health.status, 200);
-    assert.deepEqual(await health.json(), { ok: true });
+    const healthBody = await health.json();
+    assert.equal(healthBody.ok, true);
+    assert.equal(typeof healthBody.uptime, 'number');
+    assert.equal(typeof healthBody.backend, 'string');
+    assert.equal(typeof healthBody.slots.active, 'number');
+    assert.equal(typeof healthBody.slots.queued, 'number');
 
     const models = await fetch(`${baseUrl}/v1/models`);
     assert.equal(models.status, 200);
@@ -27,6 +32,51 @@ test('health and models endpoints are OpenAI-compatible enough for discovery', a
     assert.equal(body.data.some((model) => model.id === 'qwen3.7-max'), true);
     assert.equal(body.data.some((model) => model.id === 'deepseek-v4-flash'), true);
   } finally {
+    server.close();
+  }
+});
+
+test('completed requests show up in /usage/recent history', async () => {
+  const originalRun = qoderCli.runQoderCnCli;
+  qoderCli.runQoderCnCli = async () => 'OK';
+  const { server, baseUrl } = await listen(createApp());
+  try {
+    const completion = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(completion.status, 200);
+
+    const recent = await fetch(`${baseUrl}/usage/recent`);
+    assert.equal(recent.status, 200);
+    const { requests } = await recent.json();
+    assert.ok(Array.isArray(requests));
+    const entry = requests.find((r) => r.endpoint === 'chat' && r.ok);
+    assert.ok(entry, 'expected a successful chat entry in request history');
+    assert.equal(typeof entry.ms, 'number');
+    assert.ok(entry.ts);
+  } finally {
+    qoderCli.runQoderCnCli = originalRun;
+    server.close();
+  }
+});
+
+test('invalid x-qoder-timeout header is rejected with 400', async () => {
+  const originalRun = qoderCli.runQoderCnCli;
+  qoderCli.runQoderCnCli = async () => 'OK';
+  const { server, baseUrl } = await listen(createApp());
+  try {
+    const rejected = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-qoder-timeout': 'abc' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(rejected.status, 400);
+    const body = await rejected.json();
+    assert.equal(body.error.code, 'invalid_timeout');
+  } finally {
+    qoderCli.runQoderCnCli = originalRun;
     server.close();
   }
 });

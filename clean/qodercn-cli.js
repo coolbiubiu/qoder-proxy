@@ -5,6 +5,7 @@ const { AppError } = require('./errors');
 const { redactString } = require('./redact');
 const { resolveModelRoute } = require('./models');
 const { buildToolSystemPrompt, formatToolResultForPrompt } = require('./tool-parser');
+const { withCliSlot } = require('./concurrency');
 
 const DEFAULT_TIMEOUT_MS = 300000;
 const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
@@ -387,15 +388,20 @@ function createPromptAttachment(rootDir, prompt) {
   return filePath;
 }
 
-function runQoderCnCli({
+/**
+ * Gather everything both run modes need before spawning: backend config,
+ * token check, prompt construction, CLI args and the final spawn spec.
+ */
+function prepareCliInvocation({
   messages,
   model,
   tools,
   reasoningEffort,
   contextWindow,
   maxOutputTokens,
-  signal,
-  rootDir = process.cwd(),
+  timeoutOverride,
+  rootDir,
+  stream,
 }) {
   const backend = getCliBackend();
   const token = process.env[backend.tokenEnvVar];
@@ -419,44 +425,81 @@ function runQoderCnCli({
   const hasSystemToolPrompt = systemMessages.some((m) => /\[Tool Protocol\]/.test(normalizeContent(m.content)));
   const command = resolveCliCommand(process.env.CLI_COMMAND || process.env.QODERCN_CLI_PATH || backend.command);
   const modelRoute = resolveModelRoute(model);
-  const cliModel = modelRoute.cliModel;
   // Build prompt with non-system messages only (system prompt goes via CLI flag)
   const prompt = buildPrompt(nonSystemMessages, tools, hasSystemToolPrompt);
-  const timeoutMs = Number(process.env.QODERCN_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
+  // Per-request override (x-qoder-timeout header) wins over the global default.
+  const timeoutMs =
+    Number.isFinite(timeoutOverride) && timeoutOverride > 0
+      ? timeoutOverride
+      : Number(process.env.QODERCN_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
   const effort = reasoningEffort || modelRoute.reasoningEffort || process.env.QODERCN_REASONING_EFFORT;
   const windowSize = contextWindow || process.env.QODERCN_CONTEXT_WINDOW;
   const outputTokens = maxOutputTokens || process.env.QODERCN_MAX_OUTPUT_TOKENS;
   const attachmentPath = createPromptAttachment(rootDir, prompt);
   const args = buildCliArgs({
     prompt,
-    model: cliModel,
+    model: modelRoute.cliModel,
     reasoningEffort: effort,
     contextWindow: windowSize,
     maxOutputTokens: outputTokens,
     attachmentPath,
     appendSystemPrompt: appendSystemPrompt || undefined,
+    stream,
   });
   const spawnSpec = buildSpawnCommand(command, args, backend);
   const finalArgs = fixLongAppendSystemPrompt(spawnSpec.args, attachmentPath, spawnSpec.command);
+  const env = buildChildEnv(rootDir, token, backend);
 
+  return {
+    backend,
+    attachmentPath,
+    timeoutMs,
+    spawnSpec: { command: spawnSpec.command, args: finalArgs },
+    env,
+  };
+}
+
+/**
+ * Shared child-process lifecycle for buffered and streaming runs: spawn,
+ * timeout, abort handling, stderr capture and output-size limits.
+ * `onStdout` receives each stdout chunk; the promise resolves with the
+ * child's exit code once all output has been consumed.
+ */
+// Child processes spawned by in-flight requests. Tracked so a graceful
+// shutdown can terminate them instead of leaving orphans behind.
+const activeProcesses = new Set();
+
+function shutdownCliProcesses() {
+  for (const child of activeProcesses) {
+    try {
+      child.kill();
+    } catch (_) {
+      // Already exited — nothing to clean up.
+    }
+  }
+  activeProcesses.clear();
+}
+
+function spawnCli({ spawnSpec, env, rootDir, timeoutMs, attachmentPath, signal, backend, onStdout }) {
   return new Promise((resolve, reject) => {
     let stdoutBytes = 0;
     let stderrBytes = 0;
-    const stdoutChunks = [];
     const stderrChunks = [];
     let settled = false;
     let timedOut = false;
 
-    const child = spawn(spawnSpec.command, finalArgs, {
+    const child = spawn(spawnSpec.command, spawnSpec.args, {
       cwd: rootDir,
-      env: buildChildEnv(rootDir, token, backend),
+      env,
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    activeProcesses.add(child);
 
     const finish = (fn, value) => {
       if (settled) return;
       settled = true;
+      activeProcesses.delete(child);
       clearTimeout(timer);
       signal?.removeEventListener?.('abort', onAbort);
       fs.rmSync(attachmentPath, { force: true });
@@ -490,7 +533,11 @@ function runQoderCnCli({
 
     child.stdout.on('data', (chunk) => {
       try {
-        stdoutBytes = appendChunk(stdoutChunks, chunk, stdoutBytes);
+        stdoutBytes += chunk.length;
+        if (stdoutBytes > MAX_OUTPUT_BYTES) {
+          throw new AppError(502, 'upstream_output_too_large', `${backend.command} output exceeded the limit.`);
+        }
+        onStdout(chunk);
       } catch (error) {
         child.kill();
         finish(reject, error);
@@ -519,14 +566,44 @@ function runQoderCnCli({
         finish(reject, new AppError(502, 'upstream_error', `${backend.command} failed.${suffix}`));
         return;
       }
-
-      try {
-        const stdout = Buffer.concat(stdoutChunks).toString('utf8');
-        finish(resolve, extractAssistantContent(stdout));
-      } catch (error) {
-        finish(reject, error);
-      }
+      finish(resolve, code);
     });
+  });
+}
+
+function runQoderCnCli({
+  messages,
+  model,
+  tools,
+  reasoningEffort,
+  contextWindow,
+  maxOutputTokens,
+  timeoutOverride,
+  signal,
+  rootDir = process.cwd(),
+}) {
+  return withCliSlot(async () => {
+    const prepared = prepareCliInvocation({
+      messages,
+      model,
+      tools,
+      reasoningEffort,
+      contextWindow,
+      maxOutputTokens,
+      timeoutOverride,
+      rootDir,
+    });
+
+    const stdoutChunks = [];
+    await spawnCli({
+      ...prepared,
+      rootDir,
+      signal,
+      onStdout: (chunk) => stdoutChunks.push(chunk),
+    });
+
+    const stdout = Buffer.concat(stdoutChunks).toString('utf8');
+    return extractAssistantContent(stdout);
   });
 }
 
@@ -563,198 +640,82 @@ function runQoderCnCliStream({
   reasoningEffort,
   contextWindow,
   maxOutputTokens,
+  timeoutOverride,
   signal,
   rootDir = process.cwd(),
   onDelta,
 }) {
-  const backend = getCliBackend();
-  const token = process.env[backend.tokenEnvVar];
-  if (!token) {
-    throw new AppError(
-      401,
-      'cli_token_missing',
-      `${backend.tokenEnvVar} is not configured. Set it in .env or run \`${backend.command} login\` first.`,
-      'authentication_error'
-    );
-  }
+  return withCliSlot(async () => {
+    const prepared = prepareCliInvocation({
+      messages,
+      model,
+      tools,
+      reasoningEffort,
+      contextWindow,
+      maxOutputTokens,
+      timeoutOverride,
+      rootDir,
+      stream: true,
+    });
 
-  const systemMessages = messages.filter((m) => isSystemRole(m.role));
-  const nonSystemMessages = messages.filter((m) => !isSystemRole(m.role));
-  const appendSystemPrompt = systemMessages
-    .map((m) => normalizeContent(m.content))
-    .filter(Boolean)
-    .join('\n\n');
-
-  const hasSystemToolPrompt = systemMessages.some((m) => /\[Tool Protocol\]/.test(normalizeContent(m.content)));
-  const command = resolveCliCommand(process.env.CLI_COMMAND || process.env.QODERCN_CLI_PATH || backend.command);
-  const modelRoute = resolveModelRoute(model);
-  const cliModel = modelRoute.cliModel;
-  const prompt = buildPrompt(nonSystemMessages, tools, hasSystemToolPrompt);
-  const timeoutMs = Number(process.env.QODERCN_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
-  const effort = reasoningEffort || modelRoute.reasoningEffort || process.env.QODERCN_REASONING_EFFORT;
-  const windowSize = contextWindow || process.env.QODERCN_CONTEXT_WINDOW;
-  const outputTokens = maxOutputTokens || process.env.QODERCN_MAX_OUTPUT_TOKENS;
-  const attachmentPath = createPromptAttachment(rootDir, prompt);
-  const args = buildCliArgs({
-    prompt,
-    model: cliModel,
-    reasoningEffort: effort,
-    contextWindow: windowSize,
-    maxOutputTokens: outputTokens,
-    attachmentPath,
-    appendSystemPrompt: appendSystemPrompt || undefined,
-    stream: true,
-  });
-  const spawnSpec = buildSpawnCommand(command, args, backend);
-  const finalArgs = fixLongAppendSystemPrompt(spawnSpec.args, attachmentPath, spawnSpec.command);
-
-  return new Promise((resolve, reject) => {
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    const stderrChunks = [];
-    let settled = false;
-    let timedOut = false;
     let lineBuffer = '';
     const fullTextParts = [];
     // Keep parsed records so we can fall back to a final `result`-style
     // record when no assistant deltas were recognized during streaming.
     const parsedRecords = [];
 
-    const child = spawn(spawnSpec.command, finalArgs, {
-      cwd: rootDir,
-      env: buildChildEnv(rootDir, token, backend),
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    const handleLine = (line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
 
-    const finish = (fn, value) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      signal?.removeEventListener?.('abort', onAbort);
-      fs.rmSync(attachmentPath, { force: true });
-      fn(value);
+      try {
+        const record = JSON.parse(trimmed);
+        parsedRecords.push(record);
+        const delta = extractStreamDelta(record);
+        if (delta) {
+          fullTextParts.push(delta);
+          onDelta(delta);
+        }
+      } catch (_) {
+        // Non-JSON line — skip silently (status messages, ANSI, etc.)
+      }
     };
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill();
-    }, timeoutMs);
-
-    const onAbort = () => {
-      child.kill();
-      finish(
-        reject,
-        new AppError(499, 'request_cancelled', 'Request was cancelled by the client.')
-      );
-    };
-
-    if (signal?.aborted) return onAbort();
-    signal?.addEventListener?.('abort', onAbort, { once: true });
-
-    child.on('error', (error) => {
-      const code = error.code === 'ENOENT' ? 'cli_not_found' : 'cli_error';
-      const message =
-        error.code === 'ENOENT'
-          ? `${backend.command} is not installed or not on PATH.`
-          : `Failed to start ${backend.command}.`;
-      finish(reject, new AppError(502, code, message));
+    await spawnCli({
+      ...prepared,
+      rootDir,
+      signal,
+      onStdout: (chunk) => {
+        lineBuffer += chunk.toString('utf8');
+        const lines = lineBuffer.split(/\r?\n/);
+        lineBuffer = lines.pop() || '';
+        for (const line of lines) handleLine(line);
+      },
     });
 
-    child.stdout.on('data', (chunk) => {
-      try {
-        const nextBytes = stdoutBytes + chunk.length;
-        if (nextBytes > MAX_OUTPUT_BYTES) {
-          throw new AppError(502, 'upstream_output_too_large', `${backend.command} output exceeded the limit.`);
-        }
-        stdoutBytes = nextBytes;
-      } catch (error) {
-        child.kill();
-        finish(reject, error);
-        return;
-      }
+    // Flush the partial line left over after the child exited
+    handleLine(lineBuffer);
 
-      lineBuffer += chunk.toString('utf8');
-      const lines = lineBuffer.split(/\r?\n/);
-      lineBuffer = lines.pop() || '';
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-
-        try {
-          const record = JSON.parse(trimmed);
-          parsedRecords.push(record);
-          const delta = extractStreamDelta(record);
-          if (delta) {
-            fullTextParts.push(delta);
-            onDelta(delta);
+    // Fallback: no assistant deltas recognized, but the CLI exited cleanly.
+    // Pull the final text out of the last meaningful record (e.g. a
+    // `type: "result"` summary) so streaming clients don't get an empty
+    // message while non-streaming requests would have succeeded.
+    if (!fullTextParts.length && parsedRecords.length) {
+      for (let i = parsedRecords.length - 1; i >= 0; i -= 1) {
+        const text = extractText(parsedRecords[i]).trim();
+        if (text) {
+          fullTextParts.push(text);
+          try {
+            onDelta(text);
+          } catch (_) {
+            // Client connection may already be gone — still resolve.
           }
-        } catch (_) {
-          // Non-JSON line — skip silently (status messages, ANSI, etc.)
+          break;
         }
       }
-    });
+    }
 
-    child.stderr.on('data', (chunk) => {
-      try {
-        stderrBytes = appendChunk(stderrChunks, chunk, stderrBytes);
-      } catch (error) {
-        child.kill();
-        finish(reject, error);
-      }
-    });
-
-    child.on('close', (code) => {
-      // Flush remaining buffer
-      if (lineBuffer.trim()) {
-        try {
-          const record = JSON.parse(lineBuffer.trim());
-          parsedRecords.push(record);
-          const delta = extractStreamDelta(record);
-          if (delta) {
-            fullTextParts.push(delta);
-            onDelta(delta);
-          }
-        } catch (_) {
-          // Ignore
-        }
-      }
-
-      if (settled) return;
-      if (timedOut) {
-        finish(reject, new AppError(504, 'upstream_timeout', `${backend.command} request timed out.`));
-        return;
-      }
-      if (code !== 0) {
-        const stderr = Buffer.concat(stderrChunks).toString('utf8');
-        const detail = redactString(stderr).trim();
-        const suffix = detail ? ` ${detail.slice(0, 240)}` : '';
-        finish(reject, new AppError(502, 'upstream_error', `${backend.command} failed.${suffix}`));
-        return;
-      }
-
-      // Fallback: no assistant deltas recognized, but the CLI exited cleanly.
-      // Pull the final text out of the last meaningful record (e.g. a
-      // `type: "result"` summary) so streaming clients don't get an empty
-      // message while non-streaming requests would have succeeded.
-      if (!fullTextParts.length && parsedRecords.length) {
-        for (let i = parsedRecords.length - 1; i >= 0; i -= 1) {
-          const text = extractText(parsedRecords[i]).trim();
-          if (text) {
-            fullTextParts.push(text);
-            try {
-              onDelta(text);
-            } catch (_) {
-              // Client connection may already be gone — still resolve.
-            }
-            break;
-          }
-        }
-      }
-
-      finish(resolve, fullTextParts.join(''));
-    });
+    return fullTextParts.join('');
   });
 }
 
@@ -769,7 +730,10 @@ module.exports = {
   fixLongAppendSystemPrompt,
   getCliBackend,
   normalizeMessages,
+  prepareCliInvocation,
   resolveCliCommand,
   runQoderCnCli,
   runQoderCnCliStream,
+  shutdownCliProcesses,
+  spawnCli,
 };

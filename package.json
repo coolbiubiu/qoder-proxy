@@ -24,7 +24,7 @@
     "build": "esbuild clean/server.js --bundle --platform=node --target=node18 --outfile=dist/server.js",
     "start:prod": "node dist/server.js",
     "build:start": "npm run build && npm run start:prod",
-    "test": "node --test",
+    "test": "node --test --require ./test/setup.js",
     "smoke": "node scripts/smoke.js",
     "smoke:full": "node scripts/smoke.js --full"
   },
