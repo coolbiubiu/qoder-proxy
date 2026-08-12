@@ -266,7 +266,9 @@ function estimateAnthropicInputTokens(body) {
       ? body.messages.map((message) => normalizeAnthropicText(message.content))
       : []),
   ].join('\n');
-  return Math.max(1, Math.ceil(text.length / 4));
+  // Reuse the shared estimator so count_tokens and the per-request history
+  // rows agree on the same chars-per-token ratio.
+  return Math.max(1, estimateTokens(text));
 }
 
 module.exports = {

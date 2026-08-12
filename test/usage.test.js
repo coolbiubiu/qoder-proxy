@@ -201,3 +201,38 @@ test('Existing endpoints still work after adding usage routes', async () => {
     server.close();
   }
 });
+
+test('requestsToday resets when persisted stats are from a previous day', () => {
+  const fs = require('fs');
+  const usageFile = process.env.QODER_PROXY_USAGE_FILE;
+  const usagePath = require.resolve('../clean/usage');
+  const baseStats = {
+    startedAt: new Date().toISOString(),
+    totalRequests: 7,
+    requestsToday: 7,
+    requestsByModel: { auto: 7 },
+    lastRequestAt: new Date().toISOString(),
+    errorCount: 0,
+    estimatedInputTokens: 10,
+    estimatedOutputTokens: 5,
+    estimatedTotalTokens: 15,
+  };
+
+  // Stats saved yesterday: requestsToday must not carry over.
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  fs.writeFileSync(usageFile, JSON.stringify({ ...baseStats, day: yesterday }));
+  delete require.cache[usagePath];
+  let fresh = require('../clean/usage');
+  assert.equal(fresh.getUsage().totalRequests, 7);
+  assert.equal(fresh.getUsage().requestsToday, 0);
+
+  // Stats saved today: requestsToday survives the restart.
+  const today = new Date().toISOString().slice(0, 10);
+  fs.writeFileSync(usageFile, JSON.stringify({ ...baseStats, day: today }));
+  delete require.cache[usagePath];
+  fresh = require('../clean/usage');
+  assert.equal(fresh.getUsage().requestsToday, 7);
+
+  fresh.resetUsage();
+  delete require.cache[usagePath];
+});

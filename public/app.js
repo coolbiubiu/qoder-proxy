@@ -92,6 +92,10 @@ function switchTab(tab) {
   if (tab === 'dashboard') loadDashboard();
   if (tab === 'models') loadModels();
   if (tab === 'usage') loadUsage();
+
+  // Live dashboard tiles only need polling while their tab is visible.
+  if (tab === 'dashboard') startDashboardRefresh();
+  else stopDashboardRefresh();
 }
 
 // ─── API helpers ───────────────────────────────────────────────────────────────
@@ -195,7 +199,12 @@ function loadDashboard() {
         '</div>' +
         '<div class="alert info">Local protocol adapter running. Access the Web UI at <code>' + escapeHtml(window.location.origin + '/ui') + '</code></div>';
       container.dataset.loaded = '1';
-      startDashboardRefresh();
+      // This also runs from the API-key save handler while another tab may be
+      // open, so only start polling when the dashboard is actually visible.
+      var dashboardSection = document.getElementById('dashboard');
+      if (dashboardSection && dashboardSection.classList.contains('active')) {
+        startDashboardRefresh();
+      }
     })
     .catch(function (err) {
       container.innerHTML =
@@ -226,6 +235,13 @@ function startDashboardRefresh() {
       })
       .catch(function () {});
   }, 15000);
+}
+
+function stopDashboardRefresh() {
+  if (dashboardRefreshTimer) {
+    clearInterval(dashboardRefreshTimer);
+    dashboardRefreshTimer = null;
+  }
 }
 
 // ─── Models ────────────────────────────────────────────────────────────────────
@@ -455,6 +471,11 @@ function initConfig() {
 
 // ─── Usage / Credits ─────────────────────────────────────────────────────────
 
+var recentFilters = { endpoint: '', model: '', ok: '' };
+var currentRecentRequests = [];
+// Coalesces bursts of SSE events into one refresh pass.
+var usageLiveUpdatePending = false;
+
 function loadUsage() {
   var container = document.getElementById('usage-content');
   if (!container || container.dataset.loaded === '1') return;
@@ -462,13 +483,12 @@ function loadUsage() {
 
   api('/usage/local')
     .then(function (data) {
-      return api('/usage/recent?limit=20').catch(function () { return { requests: [] }; }).then(function (recent) {
-        return { data: data, recent: (recent && recent.requests) || [] };
+      return api('/usage/hourly?hours=24').catch(function () { return { hours: [] }; }).then(function (hourly) {
+        return { data: data, hourly: (hourly && hourly.hours) || [] };
       });
     })
     .then(function (result) {
       var data = result.data;
-      var recent = result.recent;
       var modelRows = '';
       if (data.requestsByModel && Object.keys(data.requestsByModel).length > 0) {
         var rows = Object.keys(data.requestsByModel).map(function (model) {
@@ -491,56 +511,6 @@ function loadUsage() {
       var lastReq = data.lastRequestAt
         ? new Date(data.lastRequestAt).toLocaleString()
         : 'Never';
-
-      var recentRows = '';
-      if (recent.length > 0) {
-        var rowsHtml = recent.map(function (r) {
-          var statusHtml = r.ok
-            ? '<span style="color:var(--success)">OK</span>'
-            : '<span style="color:var(--danger,#f66)">' + escapeHtml(r.error || 'error') + '</span>';
-          var modeHtml = r.stream
-            ? '<span style="color:var(--text-secondary)">stream</span>'
-            : '<span style="color:var(--text-secondary)">buffered</span>';
-          var tokensHtml = (r.inputTokens || r.outputTokens)
-            ? (r.inputTokens || 0) + ' / ' + (r.outputTokens || 0)
-            : '-';
-          return (
-            '<tr>' +
-              '<td>' + escapeHtml(new Date(r.ts).toLocaleTimeString()) + '</td>' +
-              '<td><code>' + escapeHtml(r.endpoint || '') + '</code></td>' +
-              '<td><code>' + escapeHtml(r.model || '') + '</code></td>' +
-              '<td>' + statusHtml + '</td>' +
-              '<td>' + (r.ms || 0) + ' ms</td>' +
-              '<td>' + modeHtml + '</td>' +
-              '<td>' + (r.toolCount || 0) + '</td>' +
-              '<td>' + tokensHtml + '</td>' +
-              '<td>' + (r.messageCount != null ? r.messageCount : '-') + '</td>' +
-              '<td>' + (r.reasoningEffort != null ? escapeHtml(String(r.reasoningEffort)) : '-') + '</td>' +
-            '</tr>'
-          );
-        }).join('');
-        recentRows =
-          '<div class="glass card" style="padding:0;overflow:hidden;">' +
-            '<h3 style="padding:0.75rem 1rem 0;font-size:0.8125rem;color:var(--text-secondary)">Recent Requests</h3>' +
-            '<div style="overflow-x:auto;">' +
-            '<table>' +
-              '<thead><tr>' +
-                '<th style="padding:0.75rem 1rem">Time</th>' +
-                '<th style="padding:0.75rem 1rem">Endpoint</th>' +
-                '<th style="padding:0.75rem 1rem">Model</th>' +
-                '<th style="padding:0.75rem 1rem">Status</th>' +
-                '<th style="padding:0.75rem 1rem">Latency</th>' +
-                '<th style="padding:0.75rem 1rem">Mode</th>' +
-                '<th style="padding:0.75rem 1rem">Tools</th>' +
-                '<th style="padding:0.75rem 1rem">Tokens (in/out)</th>' +
-                '<th style="padding:0.75rem 1rem">Msgs</th>' +
-                '<th style="padding:0.75rem 1rem">Effort</th>' +
-              '</tr></thead>' +
-              '<tbody>' + rowsHtml + '</tbody>' +
-            '</table>' +
-            '</div>' +
-          '</div>';
-      }
 
       container.innerHTML =
         '<div class="alert warning">These are <strong>local estimates only</strong>. They do not represent official Qoder billing or remaining quota.</div>' +
@@ -582,19 +552,361 @@ function loadUsage() {
           '</table>' +
         '</div>' +
 
+        '<div class="glass card">' +
+          '<h3 style="font-size:0.8125rem;color:var(--text-secondary);margin-bottom:0.75rem">Requests — Last 24 Hours</h3>' +
+          '<canvas id="usage-hourly-chart" width="860" height="150" style="width:100%;height:150px;"></canvas>' +
+        '</div>' +
+
         modelRows +
 
-        recentRows +
+        '<div class="glass card">' +
+          '<h3 style="font-size:0.8125rem;color:var(--text-secondary);margin-bottom:0.75rem">Active Requests</h3>' +
+          '<div id="active-requests-container"><span style="color:var(--text-secondary)">Loading…</span></div>' +
+        '</div>' +
+
+        '<div class="glass card" style="padding:0;overflow:hidden;">' +
+          '<div style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;padding:0.75rem 1rem;">' +
+            '<h3 style="font-size:0.8125rem;color:var(--text-secondary);margin:0">Recent Requests</h3>' +
+            '<span style="flex:1"></span>' +
+            '<select id="filter-endpoint" class="usage-filter">' +
+              '<option value="">All endpoints</option>' +
+              '<option value="chat">chat</option>' +
+              '<option value="anthropic">anthropic</option>' +
+            '</select>' +
+            '<input id="filter-model" class="usage-filter" placeholder="Model…">' +
+            '<select id="filter-ok" class="usage-filter">' +
+              '<option value="">All statuses</option>' +
+              '<option value="true">OK only</option>' +
+              '<option value="false">Errors only</option>' +
+            '</select>' +
+            '<button class="btn copy" id="recent-refresh-btn">Refresh</button>' +
+            '<button class="btn copy" id="recent-export-csv" title="Download filtered rows as CSV">CSV</button>' +
+            '<button class="btn copy" id="recent-export-json" title="Download filtered rows as JSON">JSON</button>' +
+          '</div>' +
+          '<div style="overflow-x:auto;">' +
+            '<table>' +
+              '<thead><tr>' +
+                '<th style="padding:0.75rem 1rem">Time</th>' +
+                '<th style="padding:0.75rem 1rem">Endpoint</th>' +
+                '<th style="padding:0.75rem 1rem">Model</th>' +
+                '<th style="padding:0.75rem 1rem">Status</th>' +
+                '<th style="padding:0.75rem 1rem">Latency</th>' +
+                '<th style="padding:0.75rem 1rem">Mode</th>' +
+                '<th style="padding:0.75rem 1rem">Tools</th>' +
+                '<th style="padding:0.75rem 1rem">Tokens (in/out)</th>' +
+                '<th style="padding:0.75rem 1rem">Msgs</th>' +
+                '<th style="padding:0.75rem 1rem">Effort</th>' +
+              '</tr></thead>' +
+              '<tbody id="recent-requests-body"></tbody>' +
+            '</table>' +
+          '</div>' +
+        '</div>' +
 
         '<button class="btn danger" id="reset-usage-btn">Reset Local Stats</button>';
       container.dataset.loaded = '1';
 
+      drawHourlyChart(result.hourly);
+      bindUsageControls();
+      loadRecentRequests();
+      loadActiveRequests();
       document.getElementById('reset-usage-btn').addEventListener('click', resetUsage);
     })
     .catch(function (err) {
       container.innerHTML =
         '<div class="alert error">Failed to load usage: ' + escapeHtml(err.message) + '</div>';
     });
+}
+
+function buildRecentQuery() {
+  var params = ['limit=100'];
+  if (recentFilters.endpoint) params.push('endpoint=' + encodeURIComponent(recentFilters.endpoint));
+  if (recentFilters.model) params.push('model=' + encodeURIComponent(recentFilters.model));
+  if (recentFilters.ok) params.push('ok=' + recentFilters.ok);
+  return '/usage/recent?' + params.join('&');
+}
+
+function loadRecentRequests() {
+  var tbody = document.getElementById('recent-requests-body');
+  if (!tbody) return;
+
+  api(buildRecentQuery())
+    .then(function (recent) {
+      currentRecentRequests = (recent && recent.requests) || [];
+      renderRecentRows(tbody, currentRecentRequests);
+    })
+    .catch(function () {
+      currentRecentRequests = [];
+      renderRecentRows(tbody, []);
+    });
+}
+
+function renderRecentRows(tbody, recent) {
+  if (!recent.length) {
+    tbody.innerHTML =
+      '<tr><td colspan="10" style="padding:1rem;text-align:center;color:var(--text-secondary)">No requests recorded.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = recent.map(function (r, idx) {
+    var statusHtml = r.ok
+      ? '<span style="color:var(--success)">OK</span>'
+      : '<span style="color:var(--danger,#f66)">' + escapeHtml(r.error || 'error') + '</span>';
+    var modeHtml = r.stream
+      ? '<span style="color:var(--text-secondary)">stream</span>'
+      : '<span style="color:var(--text-secondary)">buffered</span>';
+    var tokensHtml = (r.inputTokens || r.outputTokens)
+      ? (r.inputTokens || 0) + ' / ' + (r.outputTokens || 0)
+      : '-';
+    return (
+      '<tr data-idx="' + idx + '" style="cursor:pointer">' +
+        '<td>' + escapeHtml(new Date(r.ts).toLocaleTimeString()) + '</td>' +
+        '<td><code>' + escapeHtml(r.endpoint || '') + '</code></td>' +
+        '<td><code>' + escapeHtml(r.model || '') + '</code></td>' +
+        '<td>' + statusHtml + '</td>' +
+        '<td>' + (r.ms || 0) + ' ms</td>' +
+        '<td>' + modeHtml + '</td>' +
+        '<td>' + (r.toolCount || 0) + '</td>' +
+        '<td>' + tokensHtml + '</td>' +
+        '<td>' + (r.messageCount != null ? r.messageCount : '-') + '</td>' +
+        '<td>' + (r.reasoningEffort != null ? escapeHtml(String(r.reasoningEffort)) : '-') + '</td>' +
+      '</tr>'
+    );
+  }).join('');
+}
+
+function loadActiveRequests() {
+  var container = document.getElementById('active-requests-container');
+  if (!container) return;
+
+  api('/usage/active')
+    .then(function (data) {
+      var requests = (data && data.requests) || [];
+      if (!requests.length) {
+        container.innerHTML = '<span style="color:var(--text-secondary)">No requests in flight.</span>';
+        return;
+      }
+      container.innerHTML =
+        '<div style="overflow-x:auto;"><table>' +
+          '<thead><tr><th style="padding:0.5rem 1rem">Endpoint</th><th style="padding:0.5rem 1rem">Model</th><th style="padding:0.5rem 1rem">Elapsed</th><th style="padding:0.5rem 1rem"></th></tr></thead>' +
+          '<tbody>' +
+          requests.map(function (r) {
+            return (
+              '<tr>' +
+                '<td><code>' + escapeHtml(r.endpoint || '') + '</code></td>' +
+                '<td><code>' + escapeHtml(r.model || '') + '</code></td>' +
+                '<td>' + Math.round((r.elapsedMs || 0) / 1000) + 's</td>' +
+                '<td><button class="btn copy cancel-active-btn" data-id="' + escapeHtml(r.id) + '">Cancel</button></td>' +
+              '</tr>'
+            );
+          }).join('') +
+          '</tbody></table></div>';
+
+      container.querySelectorAll('.cancel-active-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          btn.disabled = true;
+          api('/usage/active/' + encodeURIComponent(btn.dataset.id), { method: 'DELETE' })
+            .then(function () {
+              loadActiveRequests();
+              loadRecentRequests();
+            })
+            .catch(function (err) {
+              alert('Failed to cancel: ' + err.message);
+              btn.disabled = false;
+            });
+        });
+      });
+    })
+    .catch(function () {
+      container.innerHTML = '<span style="color:var(--text-secondary)">Unavailable.</span>';
+    });
+}
+
+function bindUsageControls() {
+  var endpointSel = document.getElementById('filter-endpoint');
+  var modelInput = document.getElementById('filter-model');
+  var okSel = document.getElementById('filter-ok');
+  if (endpointSel) {
+    endpointSel.value = recentFilters.endpoint;
+    endpointSel.addEventListener('change', function () {
+      recentFilters.endpoint = endpointSel.value;
+      loadRecentRequests();
+    });
+  }
+  if (modelInput) {
+    modelInput.value = recentFilters.model;
+    modelInput.addEventListener('change', function () {
+      recentFilters.model = modelInput.value.trim();
+      loadRecentRequests();
+    });
+  }
+  if (okSel) {
+    okSel.value = recentFilters.ok;
+    okSel.addEventListener('change', function () {
+      recentFilters.ok = okSel.value;
+      loadRecentRequests();
+    });
+  }
+
+  var refreshBtn = document.getElementById('recent-refresh-btn');
+  if (refreshBtn) refreshBtn.addEventListener('click', loadRecentRequests);
+
+  var csvBtn = document.getElementById('recent-export-csv');
+  if (csvBtn) csvBtn.addEventListener('click', function () { exportRecent('csv'); });
+  var jsonBtn = document.getElementById('recent-export-json');
+  if (jsonBtn) jsonBtn.addEventListener('click', function () { exportRecent('json'); });
+
+  // Click a row for the full-field detail drawer.
+  var tbody = document.getElementById('recent-requests-body');
+  if (tbody) {
+    tbody.addEventListener('click', function (e) {
+      var tr = e.target.closest ? e.target.closest('tr[data-idx]') : null;
+      if (!tr) return;
+      var entry = currentRecentRequests[Number(tr.dataset.idx)];
+      if (entry) showRequestDetail(entry);
+    });
+  }
+}
+
+var EXPORT_FIELDS = ['id', 'ts', 'endpoint', 'model', 'ok', 'ms', 'error', 'stream',
+  'toolCount', 'messageCount', 'inputTokens', 'outputTokens', 'toolCallDepth',
+  'reasoningEffort', 'status'];
+
+function csvEscape(value) {
+  if (value === null || value === undefined) return '';
+  var text = String(value);
+  if (/[",\n]/.test(text)) return '"' + text.replace(/"/g, '""') + '"';
+  return text;
+}
+
+function exportRecent(format) {
+  var rows = currentRecentRequests;
+  var blob;
+  var filename;
+  if (format === 'csv') {
+    var lines = [EXPORT_FIELDS.join(',')].concat(rows.map(function (r) {
+      return EXPORT_FIELDS.map(function (f) { return csvEscape(r[f]); }).join(',');
+    }));
+    blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+    filename = 'qoder-proxy-requests.csv';
+  } else {
+    blob = new Blob([JSON.stringify(rows, null, 2)], { type: 'application/json' });
+    filename = 'qoder-proxy-requests.json';
+  }
+  var url = URL.createObjectURL(blob);
+  var link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+}
+
+function showRequestDetail(entry) {
+  var fieldRows = EXPORT_FIELDS.map(function (field) {
+    var value = entry[field];
+    if (field === 'ts' && value) value = new Date(value).toLocaleString();
+    if (field === 'stream' || field === 'ok') value = value ? 'true' : 'false';
+    return (
+      '<tr><td style="padding:0.4rem 1rem;color:var(--text-secondary)">' + field + '</td>' +
+      '<td style="padding:0.4rem 1rem;word-break:break-all"><code>' +
+      escapeHtml(value === null || value === undefined ? '-' : String(value)) +
+      '</code></td></tr>'
+    );
+  }).join('');
+
+  var overlay = document.createElement('div');
+  overlay.className = 'detail-overlay';
+  overlay.innerHTML =
+    '<div class="detail-drawer glass card">' +
+      '<div style="display:flex;align-items:center;margin-bottom:0.75rem">' +
+        '<h3 style="font-size:0.875rem;margin:0">Request Details</h3>' +
+        '<span style="flex:1"></span>' +
+        '<button class="btn copy" id="detail-close-btn">Close</button>' +
+      '</div>' +
+      '<table><tbody>' + fieldRows + '</tbody></table>' +
+    '</div>';
+  overlay.addEventListener('click', function (e) {
+    if (e.target === overlay) overlay.remove();
+  });
+  overlay.querySelector('#detail-close-btn').addEventListener('click', function () {
+    overlay.remove();
+  });
+  document.body.appendChild(overlay);
+}
+
+// Pure-canvas bar chart: one bar per hour, green portion OK, red portion
+// errors. Fixed logical resolution, stretched to the card width via CSS.
+function drawHourlyChart(hourly) {
+  var canvas = document.getElementById('usage-hourly-chart');
+  if (!canvas || !canvas.getContext) return;
+  var ctx = canvas.getContext('2d');
+
+  var byHour = {};
+  (hourly || []).forEach(function (h) { byHour[h.hour] = h; });
+  var buckets = [];
+  var now = Date.now();
+  for (var i = 23; i >= 0; i--) {
+    var d = new Date(now - i * 3600000);
+    var hour = d.toISOString().slice(0, 13);
+    var real = byHour[hour];
+    buckets.push({
+      label: String(d.getHours()).padStart(2, '0') + ':00',
+      requests: real ? real.requests : 0,
+      ok: real ? real.ok : 0,
+    });
+  }
+  var max = buckets.reduce(function (acc, b) { return Math.max(acc, b.requests); }, 0) || 1;
+
+  var width = canvas.width;
+  var height = canvas.height;
+  var padBottom = 20;
+  var chartHeight = height - padBottom;
+  var barWidth = width / buckets.length;
+
+  ctx.clearRect(0, 0, width, height);
+  buckets.forEach(function (b, idx) {
+    if (!b.requests) return;
+    var totalHeight = (b.requests / max) * (chartHeight - 10);
+    var okHeight = (b.ok / b.requests) * totalHeight;
+    var x = idx * barWidth + barWidth * 0.2;
+    var w = barWidth * 0.6;
+    // Errors stack on top of the OK portion.
+    ctx.fillStyle = 'rgba(244, 63, 94, 0.85)';
+    ctx.fillRect(x, chartHeight - totalHeight, w, totalHeight - okHeight);
+    ctx.fillStyle = 'rgba(52, 211, 153, 0.85)';
+    ctx.fillRect(x, chartHeight - okHeight, w, okHeight);
+  });
+
+  ctx.fillStyle = 'rgba(148, 163, 184, 0.9)';
+  ctx.font = '10px sans-serif';
+  ctx.textAlign = 'center';
+  buckets.forEach(function (b, idx) {
+    if (idx % 4 === 0) ctx.fillText(b.label, idx * barWidth + barWidth / 2, height - 5);
+  });
+}
+
+// ─── Live event stream ──────────────────────────────────────────────────────
+
+var eventSource = null;
+
+// The server pushes a request_completed event for every finished request; the
+// Usage page refreshes its tables live while it is visible.
+function initEventStream() {
+  if (eventSource || typeof EventSource === 'undefined') return;
+  eventSource = new EventSource('/events');
+  eventSource.addEventListener('request_completed', function () {
+    var usageSection = document.getElementById('usage');
+    var container = document.getElementById('usage-content');
+    if (!usageSection || !container) return;
+    if (!usageSection.classList.contains('active') || container.dataset.loaded !== '1') return;
+    if (usageLiveUpdatePending) return;
+    usageLiveUpdatePending = true;
+    setTimeout(function () {
+      usageLiveUpdatePending = false;
+      loadRecentRequests();
+      loadActiveRequests();
+    }, 500);
+  });
 }
 
 function resetUsage() {
@@ -638,6 +950,7 @@ document.addEventListener('DOMContentLoaded', function () {
   initChat();
   initConfig();
   initApiKey();
+  initEventStream();
 
   // Theme toggle
   var themeBtn = document.getElementById('theme-toggle');

@@ -234,17 +234,22 @@ opencode run --model qoder-cn-local/qwen3.7-max --variant high "reply OK"
 
 ## API 端点
 
-设置了 `PROXY_API_KEY` 的话，`/v1/*` 与 `/usage/*` 都需要携带密钥；`/health` 不需要。
+设置了 `PROXY_API_KEY` 的话，`/v1/*` 与 `/usage/*` 都需要携带密钥；`/health`、`/metrics`、`/events` 不需要（仅暴露统计摘要，且仍受本地回环限制）。
 
 | 方法 | 路径 | 需要密钥 | 说明 |
 |------|------|------|------|
 | GET | `/health` | 否 | 健康检查，含运行时长、后端、CLI 并发槽位状态 |
+| GET | `/metrics` | 否 | Prometheus 指标（请求计数、耗时分布、槽位占用） |
+| GET | `/events` | 否 | SSE 实时事件流（`request_completed`，供控制台实时刷新） |
 | GET | `/v1/models` | 是 | 模型列表 |
 | POST | `/v1/chat/completions` | 是 | OpenAI 兼容格式对话，支持 tools 字段适配 |
 | POST | `/v1/messages` | 是 | Anthropic 兼容格式对话，支持 tool_use 字段适配 |
 | POST | `/v1/messages/count_tokens` | 是 | Token 估算 |
 | GET | `/usage/local` | 是 | 本地用量估算 |
-| GET | `/usage/recent` | 是 | 最近请求记录（内存环形缓冲，不落盘） |
+| GET | `/usage/recent` | 是 | 最近请求记录（SQLite 持久化），支持 `endpoint`/`model`/`ok` 过滤 |
+| GET | `/usage/hourly` | 是 | 按小时聚合统计（请求数/成功数/总耗时），`?hours=` 1-168 |
+| GET | `/usage/active` | 是 | 当前在途请求列表 |
+| DELETE | `/usage/active/:id` | 是 | 取消指定在途请求（终止其 CLI 子进程） |
 | POST | `/usage/reset-local` | 是 | 重置本地用量统计与请求记录 |
 
 ## 推理参数
@@ -263,9 +268,16 @@ $env:QODERCN_MAX_OUTPUT_TOKENS = "4096"
 
 ## 并发控制
 
-每次请求都会启动一个 CLI 子进程。通过 `MAX_CONCURRENT_CLI` 限制同时运行的子进程数，超出的请求进入 FIFO 队列等待；`CLI_QUEUE_TIMEOUT_MS` 控制排队超时（超时返回 503）。`/health` 的 `slots` 字段可查看当前占用与排队情况。
+每次请求都会启动一个 CLI 子进程。通过 `MAX_CONCURRENT_CLI` 限制同时运行的子进程数，超出的请求进入 FIFO 队列等待；`CLI_QUEUE_TIMEOUT_MS` 控制排队超时（超时返回 503，默认 60000ms，显式设为 0 则无限等待）。`/health` 的 `slots` 字段可查看当前占用与排队情况。
 
 进程收到 `SIGINT`/`SIGTERM` 时会优雅关闭：停止接受新连接并终止在途的 CLI 子进程，避免遗留孤儿进程。
+
+## 容错与限流
+
+- `RETRY_COUNT`（默认 0，上限 3）：CLI 崩溃/超时等瞬时失败自动重试。流式请求仅在首个增量发出前允许重试。
+- `QODER_MODEL_FALLBACK`（如 `model-a=model-b`）：主模型失败（重试耗尽）后一次性切换到备用模型，响应归属实际执行的模型。
+- `MAX_INPUT_TOKENS`：估算输入超限的请求直接返回 413 `input_too_large`，不启动 CLI 子进程；空/0 禁用。
+- `LOG_FILE`：设置后所有日志同时追加写入该文件，便于后台运行时排查。
 
 ## 流式输出
 
@@ -318,13 +330,14 @@ http://127.0.0.1:3000/ui
 | Models | 调用 /v1/models 显示模型列表 |
 | Chat Test | 用 /v1/chat/completions 做简单非流式测试 |
 | Config | 生成 OpenAI Compatible / Anthropic Compatible / OpenCode 配置示例 |
-| Usage / Credits | 本地用量统计 + 最近请求记录 |
+| Usage / Credits | 本地用量统计 + 每小时趋势图 + 在途请求管理（可取消）+ 可过滤/导出的最近请求记录，SSE 实时刷新 |
 
 ### 本地用量统计说明
 
 - Usage 页面显示的是**本地估算数据**，不代表 Qoder 官方账单或剩余额度
 - token 数量基于简单字符数估算，标记为 `estimated`，不宣称准确
-- 统计数据保存在内存中，持久化到本地 `usage.json`（不保存 prompt 正文、响应正文、token、Authorization、cookie）
+- 统计数据保存在内存中，持久化到本地 `usage.json`；请求历史持久化到本地 SQLite 数据库 `proxy.db`（均不保存 prompt 正文、响应正文、Authorization、cookie）
+- 请求历史持久化依赖 Node 22.5+ 的内置 `node:sqlite`（无需安装依赖）；低版本 Node 自动降级为内存存储，重启后历史清空
 - 官方额度：`qoderclicn --help` 中没有 quota/credits/usage 命令，因此**不实现官方额度自动读取**
 - UI 不会读取、保存、显示 Qoder PAT
 
@@ -333,8 +346,13 @@ http://127.0.0.1:3000/ui
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/usage/local` | 返回本地用量统计 |
-| GET | `/usage/recent` | 返回最近请求记录（时间、端点、模型、状态、耗时），持久化在 SQLite 数据库 `proxy.db`（项目根目录），条数上限由 `HISTORY_LIMIT` 控制，默认 100 |
+| GET | `/usage/recent` | 返回最近请求记录（时间、端点、模型、状态、耗时、流式模式、工具数、消息数、估算 token、推理强度等），持久化在 SQLite 数据库 `proxy.db`（项目根目录），条数上限由 `HISTORY_LIMIT` 控制，默认 100；支持 `endpoint`/`model`/`ok` 查询参数过滤 |
+| GET | `/usage/hourly` | 返回按小时聚合的统计（请求数、成功数、总耗时），`?hours=` 指定窗口（1-168，默认 24），数据保留 7 天 |
+| GET | `/usage/active` | 返回当前在途请求列表（id、端点、模型、已耗时） |
+| DELETE | `/usage/active/:id` | 取消指定在途请求，终止其 CLI 子进程，原请求收到 499 `request_cancelled` |
 | POST | `/usage/reset-local` | 重置本地用量统计与请求记录 |
+
+> 请求历史的 SQLite 持久化需要 Node 22.5+（内置 `node:sqlite`）；低版本自动降级为内存存储，功能不受影响，但重启后历史会清空。
 
 ## 许可证
 

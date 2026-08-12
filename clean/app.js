@@ -36,7 +36,7 @@ const {
 } = require('./tool-parser');
 const { trackRequest, getUsage, resetUsage, saveUsage, estimateTokens, extractTextFromMessages } = require('./usage');
 const { executeToolCall } = require('./tools-executor');
-const { recordRequestEntry, getRecentRequests, resetRequestHistory } = require('./request-history');
+const { recordRequestEntry, getRecentRequests, getHourlyStats, resetRequestHistory } = require('./request-history');
 const { getCliSlotStatus } = require('./concurrency');
 
 const MODEL_ID = DEFAULT_MODEL_ID;
@@ -70,14 +70,218 @@ function parseTimeoutOverrideHeader(req) {
 // shape fields: stream, toolCount, messageCount, inputTokens, outputTokens,
 // toolCallDepth, reasoningEffort, status.
 function recordOutcome({ endpoint, model, isError, started, errorCode, ...details }) {
+  const ms = Date.now() - started;
   recordRequestEntry({
     endpoint,
     model,
     ok: !isError,
-    ms: Date.now() - started,
+    ms,
     error: isError ? errorCode || 'internal_error' : undefined,
     ...details,
   });
+  recordMetrics(endpoint, !isError, ms);
+  // Live feed for the web console — same summary fields as the history row.
+  broadcastRequestEvent({
+    ts: new Date().toISOString(),
+    endpoint,
+    model,
+    ok: !isError,
+    ms,
+    error: isError ? errorCode || 'internal_error' : undefined,
+    stream: Boolean(details.stream),
+  });
+}
+
+// Reject oversized prompts before they spend a CLI slot. 0 disables the cap.
+function getMaxInputTokens() {
+  const value = Number(process.env.MAX_INPUT_TOKENS);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+// Automatic retries for transient CLI failures. Capped so a flapping CLI
+// cannot queue the same doomed request behind itself forever.
+const MAX_RETRY_COUNT = 3;
+
+function getRetryCount() {
+  const value = Number(process.env.RETRY_COUNT);
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.min(Math.floor(value), MAX_RETRY_COUNT);
+}
+
+// QODER_MODEL_FALLBACK maps a failing model to a stand-in, e.g.
+// "model-a=model-b,model-c=model-d". Unset/empty disables the fallback.
+function getModelFallback(model) {
+  const raw = process.env.QODER_MODEL_FALLBACK || '';
+  if (!raw || !model) return null;
+  for (const pair of raw.split(',')) {
+    const [from, to] = pair.split('=').map((part) => (part || '').trim());
+    if (from && to && from === model) return to;
+  }
+  return null;
+}
+
+// Upstream failures worth retrying: CLI crashes, timeouts, spawn errors.
+// Client cancellations (499) and request-shape errors (4xx) never are.
+function isRetriableError(error) {
+  if (!error || error.code === 'request_cancelled') return false;
+  return typeof error.status === 'number' && error.status >= 500;
+}
+
+async function runCliWithRetries(runCli, options) {
+  const retries = getRetryCount();
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await runCli(options);
+    } catch (error) {
+      if (attempt >= retries || !isRetriableError(error)) throw error;
+      attempt += 1;
+      log('cli call failed, retrying', { attempt, retries, code: error.code, message: error.message });
+    }
+  }
+}
+
+// Tool-loop wrapper: after per-call retries are exhausted, give the mapped
+// fallback model one full-loop chance before surfacing the failure. The
+// result carries the model that actually produced it, for stats and history.
+async function runToolLoopWithResilience(params) {
+  try {
+    const result = await runCliWithToolLoop(params);
+    return { ...result, model: params.model };
+  } catch (error) {
+    const fallback = getModelFallback(params.model);
+    if (!fallback || fallback === params.model || !isRetriableError(error)) throw error;
+    log('tool loop switching to fallback model', { from: params.model, to: fallback, code: error.code });
+    const result = await runCliWithToolLoop({ ...params, model: fallback });
+    return { ...result, model: fallback };
+  }
+}
+
+// Streaming wrapper: retries and fallback are only safe while no delta has
+// reached the client — once bytes are on the wire, the caller's SSE error
+// path is the only sensible recovery.
+async function runCliStreamWithResilience({ runStream, canRetry, model, logPrefix }) {
+  const retries = getRetryCount();
+  let attempt = 0;
+  let currentModel = model;
+  let triedFallback = false;
+  for (;;) {
+    try {
+      const text = await runStream(currentModel);
+      return { text, model: currentModel };
+    } catch (error) {
+      if (!isRetriableError(error) || !canRetry()) throw error;
+      if (attempt < retries) {
+        attempt += 1;
+        log(`${logPrefix} stream attempt failed, retrying`, { attempt, retries, code: error.code });
+        continue;
+      }
+      if (!triedFallback) {
+        const fallback = getModelFallback(currentModel);
+        if (fallback && fallback !== currentModel) {
+          triedFallback = true;
+          attempt = 0;
+          log(`${logPrefix} stream switching to fallback model`, { from: currentModel, to: fallback });
+          currentModel = fallback;
+          continue;
+        }
+      }
+      throw error;
+    }
+  }
+}
+
+// --- Prometheus metrics -------------------------------------------------------
+
+const LATENCY_BUCKETS_MS = [1000, 5000, 15000, 60000, 300000];
+const metricsCounters = new Map(); // `${endpoint}|${ok ? 1 : 0}` -> count
+const metricsLatency = new Map(); // endpoint -> { count, sumMs, buckets }
+
+function recordMetrics(endpoint, ok, ms) {
+  const key = `${endpoint}|${ok ? 1 : 0}`;
+  metricsCounters.set(key, (metricsCounters.get(key) || 0) + 1);
+  let latency = metricsLatency.get(endpoint);
+  if (!latency) {
+    latency = { count: 0, sumMs: 0, buckets: LATENCY_BUCKETS_MS.map(() => 0) };
+    metricsLatency.set(endpoint, latency);
+  }
+  latency.count += 1;
+  latency.sumMs += ms;
+  for (let i = 0; i < LATENCY_BUCKETS_MS.length; i += 1) {
+    if (ms <= LATENCY_BUCKETS_MS[i]) latency.buckets[i] += 1;
+  }
+}
+
+function renderMetrics() {
+  const lines = [
+    '# HELP qoder_proxy_requests_total Completed requests by endpoint and outcome.',
+    '# TYPE qoder_proxy_requests_total counter',
+  ];
+  for (const [key, count] of metricsCounters) {
+    const [endpoint, ok] = key.split('|');
+    lines.push(`qoder_proxy_requests_total{endpoint="${endpoint}",ok="${ok === '1'}"} ${count}`);
+  }
+  lines.push(
+    '# HELP qoder_proxy_request_duration_ms Request latency in milliseconds.',
+    '# TYPE qoder_proxy_request_duration_ms histogram'
+  );
+  for (const [endpoint, latency] of metricsLatency) {
+    let cumulative = 0;
+    for (let i = 0; i < LATENCY_BUCKETS_MS.length; i += 1) {
+      cumulative += latency.buckets[i];
+      lines.push(
+        `qoder_proxy_request_duration_ms_bucket{endpoint="${endpoint}",le="${LATENCY_BUCKETS_MS[i]}"} ${cumulative}`
+      );
+    }
+    lines.push(`qoder_proxy_request_duration_ms_bucket{endpoint="${endpoint}",le="+Inf"} ${latency.count}`);
+    lines.push(`qoder_proxy_request_duration_ms_sum{endpoint="${endpoint}"} ${latency.sumMs}`);
+    lines.push(`qoder_proxy_request_duration_ms_count{endpoint="${endpoint}"} ${latency.count}`);
+  }
+  const slots = getCliSlotStatus();
+  lines.push(
+    '# HELP qoder_proxy_cli_slots_active CLI child processes currently running.',
+    '# TYPE qoder_proxy_cli_slots_active gauge',
+    `qoder_proxy_cli_slots_active ${slots.active}`,
+    '# HELP qoder_proxy_cli_slots_queued Requests waiting for a CLI slot.',
+    '# TYPE qoder_proxy_cli_slots_queued gauge',
+    `qoder_proxy_cli_slots_queued ${slots.queued}`,
+    '# HELP qoder_proxy_cli_slots_max Configured slot cap (-1 = unlimited).',
+    '# TYPE qoder_proxy_cli_slots_max gauge',
+    `qoder_proxy_cli_slots_max ${Number.isFinite(slots.maxConcurrency) ? slots.maxConcurrency : -1}`
+  );
+  return lines.join('\n') + '\n';
+}
+
+// --- Active request tracking + live event stream ------------------------------
+
+// In-flight requests, keyed by id, so the console can list and cancel them.
+const activeRequests = new Map();
+
+function registerActiveRequest({ endpoint, model, controller }) {
+  const id = typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : makeCompletionId('req_');
+  activeRequests.set(id, {
+    id,
+    endpoint,
+    model,
+    started: Date.now(),
+    abort: () => controller.abort(),
+  });
+  return id;
+}
+
+// EventSource clients subscribed to /events.
+const eventClients = new Set();
+
+function broadcastRequestEvent(entry) {
+  if (eventClients.size === 0) return;
+  const payload = `event: request_completed\ndata: ${JSON.stringify(entry)}\n\n`;
+  for (const client of eventClients) {
+    try {
+      client.write(payload);
+    } catch (_) {
+      eventClients.delete(client);
+    }
+  }
 }
 
 // Millisecond timestamps collide under concurrency, so add randomness to keep
@@ -460,6 +664,13 @@ function createApp() {
     });
   });
 
+  // Prometheus scrape endpoint. Same exposure as /health — counts and
+  // latencies only, never request content.
+  app.get('/metrics', (_req, res) => {
+    res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+    res.send(renderMetrics());
+  });
+
   app.get('/', (_req, res) => {
     const backend = qoderCli.getCliBackend();
     // Deliberately no filesystem paths here: this route is reachable by the
@@ -470,6 +681,31 @@ function createApp() {
       name: 'qoder-proxy',
       mode: 'clean',
       cli_backend: backend.name,
+    });
+  });
+
+  // Live request-completion events for the web console. EventSource cannot
+  // send auth headers, so this sits outside apiKeyGuard like /ui — it
+  // exposes the same summary data the console already shows, and
+  // localOnlyGuard still applies.
+  app.get('/events', (req, res) => {
+    res.status(200);
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+    res.write('retry: 3000\n\n');
+    eventClients.add(res);
+    const heartbeat = setInterval(() => {
+      try {
+        res.write(': ping\n\n');
+      } catch (_) {
+        // Connection gone — the close handler below cleans up.
+      }
+    }, 30000);
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      eventClients.delete(res);
     });
   });
 
@@ -499,6 +735,7 @@ function createApp() {
     const started = Date.now();
     const controller = new AbortController();
     abortOnDisconnect(req, res, controller);
+    let activeId;
 
     try {
       validateChatRequest(req.body);
@@ -518,6 +755,16 @@ function createApp() {
         inputTokens: estimateTokens(inputText),
         reasoningEffort: requestOptions.reasoningEffort,
       };
+      // Reject oversized prompts before they spend a CLI slot on them.
+      const maxInputTokens = getMaxInputTokens();
+      if (maxInputTokens > 0 && requestDetails.inputTokens > maxInputTokens) {
+        throw new AppError(
+          413,
+          'input_too_large',
+          `Estimated input (${requestDetails.inputTokens} tokens) exceeds MAX_INPUT_TOKENS (${maxInputTokens}).`
+        );
+      }
+      activeId = registerActiveRequest({ endpoint: 'chat', model, controller });
       log('chat request accepted', {
         model,
         message_count: req.body.messages.length,
@@ -550,26 +797,39 @@ function createApp() {
         });
 
         let chatStreamText = '';
+        let streamModelUsed = model;
+        let deltaSent = false;
         try {
-          chatStreamText = await qoderCli.runQoderCnCliStream({
-            messages: req.body.messages,
+          // Retries and model fallback only apply before the first delta
+          // leaves — after that the SSE error path is the only recovery.
+          const streamed = await runCliStreamWithResilience({
             model,
-            tools: normalizedTools,
-            reasoningEffort: requestOptions.reasoningEffort,
-            contextWindow: requestOptions.contextWindow,
-            maxOutputTokens: requestOptions.maxOutputTokens,
-            timeoutOverride,
-            signal: controller.signal,
-            onDelta: (delta) => {
-              writeSse(res, {
-                id,
-                object: 'chat.completion.chunk',
-                created,
-                model,
-                choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
-              });
-            },
+            canRetry: () => !deltaSent,
+            logPrefix: 'chat',
+            runStream: (streamModel) =>
+              qoderCli.runQoderCnCliStream({
+                messages: req.body.messages,
+                model: streamModel,
+                tools: normalizedTools,
+                reasoningEffort: requestOptions.reasoningEffort,
+                contextWindow: requestOptions.contextWindow,
+                maxOutputTokens: requestOptions.maxOutputTokens,
+                timeoutOverride,
+                signal: controller.signal,
+                onDelta: (delta) => {
+                  deltaSent = true;
+                  writeSse(res, {
+                    id,
+                    object: 'chat.completion.chunk',
+                    created,
+                    model,
+                    choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
+                  });
+                },
+              }),
           });
+          chatStreamText = streamed.text;
+          streamModelUsed = streamed.model;
         } catch (streamError) {
           log('chat stream failed', {
             code: streamError.code || 'internal_error',
@@ -622,14 +882,14 @@ function createApp() {
         res.end();
         log('chat stream completed', { duration_ms: Date.now() - started });
         trackRequest({
-          model,
+          model: streamModelUsed,
           inputText,
           outputText: chatStreamText || '',
           isError: false,
         });
         recordOutcome({
           endpoint: 'chat',
-          model,
+          model: streamModelUsed,
           isError: false,
           started,
           stream: true,
@@ -641,26 +901,29 @@ function createApp() {
       }
 
       // Non-streaming path (or tool calls with stream=true → downgraded)
-      const { content: finalContent, parsedOutput: finalParsedOutput, toolCallDepth } =
-        await runCliWithToolLoop({
-          runCli: (options) => qoderCli.runQoderCnCli(options),
-          messages: req.body.messages,
-          model,
-          tools: normalizedTools,
-          requestOptions,
-          maxOutputTokens: requestOptions.maxOutputTokens,
-          timeoutOverride,
-          signal: controller.signal,
-          logPrefix: 'chat',
-        });
+      const loopResult = await runToolLoopWithResilience({
+        runCli: (options) => runCliWithRetries((opts) => qoderCli.runQoderCnCli(opts), options),
+        messages: req.body.messages,
+        model,
+        tools: normalizedTools,
+        requestOptions,
+        maxOutputTokens: requestOptions.maxOutputTokens,
+        timeoutOverride,
+        signal: controller.signal,
+        logPrefix: 'chat',
+      });
+      const { content: finalContent, parsedOutput: finalParsedOutput, toolCallDepth } = loopResult;
+      // The fallback model may have produced this answer — attribute stats,
+      // history and the response envelope to whichever model actually ran.
+      const effectiveModel = loopResult.model;
 
       if (req.body.stream) {
         // Buffered request (tools declared) — emit the parsed result as a
         // proper SSE stream, including delta.tool_calls when applicable.
-        writeChatCompletionStream(res, { model, content: finalContent, parsedOutput: finalParsedOutput });
+        writeChatCompletionStream(res, { model: effectiveModel, content: finalContent, parsedOutput: finalParsedOutput });
       } else {
         res.json(createChatCompletion({
-          model,
+          model: effectiveModel,
           content: finalContent,
           parsedOutput: finalParsedOutput,
           inputTokens: requestDetails.inputTokens,
@@ -668,14 +931,14 @@ function createApp() {
       }
       log('chat request completed', { duration_ms: Date.now() - started, tool_call_depth: toolCallDepth });
       trackRequest({
-        model,
+        model: effectiveModel,
         inputText,
         outputText: finalContent || '',
         isError: false,
       });
       recordOutcome({
         endpoint: 'chat',
-        model,
+        model: effectiveModel,
         isError: false,
         started,
         stream: Boolean(req.body.stream),
@@ -707,6 +970,8 @@ function createApp() {
         messageCount: req.body?.messages?.length ?? null,
       });
       if (!res.headersSent && !res.writableEnded) openAiError(res, error);
+    } finally {
+      if (activeId) activeRequests.delete(activeId);
     }
   });
 
@@ -714,6 +979,7 @@ function createApp() {
     const started = Date.now();
     const controller = new AbortController();
     abortOnDisconnect(req, res, controller);
+    let activeId;
 
     try {
       validateAnthropicMessagesRequest(req.body);
@@ -730,6 +996,16 @@ function createApp() {
         inputTokens: estimateTokens(inputText),
         reasoningEffort: requestOptions.reasoningEffort,
       };
+      // Reject oversized prompts before they spend a CLI slot on them.
+      const maxInputTokens = getMaxInputTokens();
+      if (maxInputTokens > 0 && requestDetails.inputTokens > maxInputTokens) {
+        throw new AppError(
+          413,
+          'input_too_large',
+          `Estimated input (${requestDetails.inputTokens} tokens) exceeds MAX_INPUT_TOKENS (${maxInputTokens}).`
+        );
+      }
+      activeId = registerActiveRequest({ endpoint: 'anthropic', model, controller });
       log('anthropic message request accepted', {
         model,
         message_count: req.body.messages.length,
@@ -771,24 +1047,37 @@ function createApp() {
         });
 
         let anthropicStreamText = '';
+        let streamModelUsed = model;
+        let deltaSent = false;
         try {
-          anthropicStreamText = await qoderCli.runQoderCnCliStream({
-            messages,
+          // Retries and model fallback only apply before the first delta
+          // leaves — after that the SSE error path is the only recovery.
+          const streamed = await runCliStreamWithResilience({
             model,
-            tools,
-            reasoningEffort: requestOptions.reasoningEffort,
-            contextWindow: requestOptions.contextWindow,
-            maxOutputTokens: requestOptions.maxOutputTokens || req.body.max_tokens,
-            timeoutOverride,
-            signal: controller.signal,
-            onDelta: (delta) => {
-              writeAnthropicSse(res, 'content_block_delta', {
-                type: 'content_block_delta',
-                index: 0,
-                delta: { type: 'text_delta', text: delta },
-              });
-            },
+            canRetry: () => !deltaSent,
+            logPrefix: 'anthropic',
+            runStream: (streamModel) =>
+              qoderCli.runQoderCnCliStream({
+                messages,
+                model: streamModel,
+                tools,
+                reasoningEffort: requestOptions.reasoningEffort,
+                contextWindow: requestOptions.contextWindow,
+                maxOutputTokens: requestOptions.maxOutputTokens || req.body.max_tokens,
+                timeoutOverride,
+                signal: controller.signal,
+                onDelta: (delta) => {
+                  deltaSent = true;
+                  writeAnthropicSse(res, 'content_block_delta', {
+                    type: 'content_block_delta',
+                    index: 0,
+                    delta: { type: 'text_delta', text: delta },
+                  });
+                },
+              }),
           });
+          anthropicStreamText = streamed.text;
+          streamModelUsed = streamed.model;
         } catch (streamError) {
           log('anthropic stream failed', {
             code: streamError.code || 'internal_error',
@@ -842,14 +1131,14 @@ function createApp() {
         res.end();
         log('anthropic stream completed', { duration_ms: Date.now() - started });
         trackRequest({
-          model,
+          model: streamModelUsed,
           inputText,
           outputText: anthropicStreamText || '',
           isError: false,
         });
         recordOutcome({
           endpoint: 'anthropic',
-          model,
+          model: streamModelUsed,
           isError: false,
           started,
           stream: true,
@@ -861,26 +1150,30 @@ function createApp() {
       }
 
       // Non-streaming path (or tool calls with stream=true → downgraded)
+      const anthropicLoopResult = await runToolLoopWithResilience({
+        runCli: (options) => runCliWithRetries((opts) => qoderCli.runQoderCnCli(opts), options),
+        messages,
+        model,
+        tools,
+        requestOptions,
+        maxOutputTokens: requestOptions.maxOutputTokens || req.body.max_tokens,
+        timeoutOverride,
+        signal: controller.signal,
+        logPrefix: 'anthropic',
+      });
       const { content: anthropicContent, parsedOutput: anthropicParsedOutput, toolCallDepth: anthropicToolDepth } =
-        await runCliWithToolLoop({
-          runCli: (options) => qoderCli.runQoderCnCli(options),
-          messages,
-          model,
-          tools,
-          requestOptions,
-          maxOutputTokens: requestOptions.maxOutputTokens || req.body.max_tokens,
-          timeoutOverride,
-          signal: controller.signal,
-          logPrefix: 'anthropic',
-        });
+        anthropicLoopResult;
+      // Attribute the response to whichever model actually produced it (the
+      // fallback may have stepped in).
+      const effectiveModel = anthropicLoopResult.model;
 
       if (req.body.stream) {
         // Buffered request (tools declared) — emit the parsed result as a
         // proper SSE stream, including tool_use blocks when applicable.
-        writeAnthropicMessageStream(res, { model, content: anthropicContent, parsedOutput: anthropicParsedOutput });
+        writeAnthropicMessageStream(res, { model: effectiveModel, content: anthropicContent, parsedOutput: anthropicParsedOutput });
       } else {
         res.json(createAnthropicMessage({
-          model,
+          model: effectiveModel,
           content: anthropicContent,
           parsedOutput: anthropicParsedOutput,
           inputTokens: requestDetails.inputTokens,
@@ -888,14 +1181,14 @@ function createApp() {
       }
       log('anthropic message request completed', { duration_ms: Date.now() - started, tool_call_depth: anthropicToolDepth });
       trackRequest({
-        model,
+        model: effectiveModel,
         inputText,
         outputText: anthropicContent || '',
         isError: false,
       });
       recordOutcome({
         endpoint: 'anthropic',
-        model,
+        model: effectiveModel,
         isError: false,
         started,
         stream: Boolean(req.body.stream),
@@ -927,6 +1220,8 @@ function createApp() {
         messageCount: req.body?.messages?.length ?? null,
       });
       if (!res.headersSent && !res.writableEnded) anthropicError(res, error);
+    } finally {
+      if (activeId) activeRequests.delete(activeId);
     }
   });
 
@@ -951,7 +1246,46 @@ function createApp() {
         throw new AppError(400, 'invalid_limit', 'limit must be a positive integer.');
       }
     }
-    res.json({ requests: getRecentRequests(limit) });
+    const filters = {};
+    if (req.query.endpoint !== undefined) filters.endpoint = String(req.query.endpoint);
+    if (req.query.model !== undefined) filters.model = String(req.query.model);
+    if (req.query.ok !== undefined) {
+      if (req.query.ok === 'true') filters.ok = true;
+      else if (req.query.ok === 'false') filters.ok = false;
+      else throw new AppError(400, 'invalid_ok', 'ok must be "true" or "false".');
+    }
+    res.json({ requests: getRecentRequests(limit, filters) });
+  });
+
+  app.get('/usage/hourly', (req, res) => {
+    let hours = 24;
+    if (req.query.hours !== undefined) {
+      hours = Number(req.query.hours);
+      if (!Number.isInteger(hours) || hours <= 0 || hours > 168) {
+        throw new AppError(400, 'invalid_hours', 'hours must be an integer between 1 and 168.');
+      }
+    }
+    res.json({ hours: getHourlyStats(hours) });
+  });
+
+  app.get('/usage/active', (_req, res) => {
+    res.json({
+      requests: [...activeRequests.values()].map(({ abort, ...info }) => ({
+        ...info,
+        elapsedMs: Date.now() - info.started,
+      })),
+    });
+  });
+
+  app.delete('/usage/active/:id', (req, res) => {
+    const entry = activeRequests.get(req.params.id);
+    if (!entry) {
+      return openAiError(res, new AppError(404, 'not_found', 'No active request with that id.'));
+    }
+    // Aborting the controller kills the CLI child and fails the original
+    // request with 499 request_cancelled.
+    entry.abort();
+    return res.json({ ok: true, id: entry.id });
   });
 
   app.post('/usage/reset-local', (_req, res) => {

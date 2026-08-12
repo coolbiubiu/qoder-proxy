@@ -1,3 +1,5 @@
+const fs = require('fs');
+const util = require('util');
 const { redact } = require('./redact');
 
 // LOG_LEVEL controls verbosity: debug < info < warn < error. Default is info,
@@ -10,13 +12,31 @@ function currentLevel() {
   return LEVELS[name] ?? LEVELS.info;
 }
 
+// Optional file sink: background runs otherwise lose their logs when the
+// terminal goes away. Best-effort — a full disk must never break request
+// handling. Redaction already happened in write().
+function appendToLogFile(line) {
+  const file = process.env.LOG_FILE;
+  if (!file) return;
+  try {
+    fs.appendFileSync(file, `${line}\n`, 'utf8');
+  } catch (_) {
+    // Ignore — console output still works.
+  }
+}
+
 function write(message, data) {
   const timestamp = new Date().toISOString();
   if (data === undefined) {
     console.log(`[${timestamp}] ${message}`);
+    appendToLogFile(`[${timestamp}] ${message}`);
     return;
   }
-  console.log(`[${timestamp}] ${message}`, redact(data));
+  const redacted = redact(data);
+  console.log(`[${timestamp}] ${message}`, redacted);
+  appendToLogFile(
+    `[${timestamp}] ${message} ${util.inspect(redacted, { depth: 4, breakLength: Infinity })}`
+  );
 }
 
 function log(message, data) {

@@ -42,6 +42,66 @@ function buildToolSystemPrompt(tools) {
 }
 
 /**
+ * Fast path: locate the `"tool_calls"` key first, then grab the innermost
+ * balanced object enclosing it in a single O(n) pass. That object is exactly
+ * the one holding tool_calls as a direct key, which is what the protocol
+ * emits. Returns null when no usable candidate exists, so the caller falls
+ * back to the exhaustive scan (e.g. the key string only appears inside an
+ * unrelated string value).
+ */
+function extractEnclosingToolCallsObject(text) {
+  const keyIndex = text.indexOf('"tool_calls"');
+  if (keyIndex === -1) return null;
+
+  const openStack = [];
+  let inString = false;
+  let escapeNext = false;
+  let depthAtKey = -1;
+  let start = -1;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+
+    // Check before the quote toggle below so the key's opening quote still
+    // counts as "outside the key's string".
+    if (i === keyIndex && depthAtKey === -1) {
+      if (!openStack.length) return null; // Key sits outside any object.
+      depthAtKey = openStack.length;
+      start = openStack[openStack.length - 1];
+    }
+
+    if (escapeNext) {
+      escapeNext = false;
+      continue;
+    }
+    if (ch === '\\' && inString) {
+      escapeNext = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+
+    if (ch === '{') {
+      openStack.push(i);
+    } else if (ch === '}') {
+      openStack.pop();
+      // The object opened at `start` just closed.
+      if (depthAtKey !== -1 && openStack.length === depthAtKey - 1) {
+        return {
+          json: text.slice(start, i + 1),
+          prefixText: text.slice(0, start).trim(),
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
  * Extract a balanced JSON object containing "tool_calls" from text.
  *
  * Uses brace-counting to find the outermost `{...}` that is properly
@@ -50,6 +110,20 @@ function buildToolSystemPrompt(tools) {
  * that a lazy regex would incorrectly close on.
  */
 function extractBalancedJsonWithToolCalls(text) {
+  // Fast path: one O(n) pass anchored on the "tool_calls" key covers the
+  // common case where the model emits a single well-formed object.
+  const fast = extractEnclosingToolCallsObject(text);
+  if (fast) {
+    try {
+      const parsed = JSON.parse(fast.json);
+      if (parsed && typeof parsed === 'object' && 'tool_calls' in parsed) {
+        return fast;
+      }
+    } catch (_) {
+      // Not valid JSON — fall through to the exhaustive scan below.
+    }
+  }
+
   // Find the first { that could start a JSON object with tool_calls
   for (let start = 0; start < text.length; start++) {
     if (text[start] !== '{') continue;

@@ -11,6 +11,10 @@ const path = require('path');
 const DEFAULT_HISTORY_LIMIT = 100;
 const MAX_HISTORY_LIMIT = 1000;
 
+// Hourly aggregates back the Usage page's trend chart. Kept for a week —
+// enough for "last 24h" views with headroom, small enough to never matter.
+const HOURLY_RETENTION_HOURS = 24 * 7;
+
 // Per-request detail columns recorded alongside the basic outcome. Declared
 // once so CREATE TABLE, the legacy-schema migration and the INSERT statement
 // can never drift apart.
@@ -65,6 +69,13 @@ function openDb() {
     for (const [name, type] of DETAIL_COLUMNS) {
       if (!existing.has(name)) db.exec(`ALTER TABLE request_history ADD COLUMN ${name} ${type}`);
     }
+    db.exec(
+      'CREATE TABLE IF NOT EXISTS usage_hourly ('
+        + 'hour TEXT PRIMARY KEY, '
+        + 'requests INTEGER NOT NULL DEFAULT 0, '
+        + 'ok INTEGER NOT NULL DEFAULT 0, '
+        + 'total_ms INTEGER NOT NULL DEFAULT 0)'
+    );
     return db;
   } catch (_) {
     // node:sqlite unavailable (older Node) or the file is not writable —
@@ -78,10 +89,14 @@ let insertStmt = null;
 let recentStmt = null;
 let countStmt = null;
 let pruneStmt = null;
+let hourlyUpsertStmt = null;
+let hourlyPruneStmt = null;
 
 // In-memory fallback ring buffer (also used if a DB write ever fails).
 const entries = [];
 let nextId = 1;
+// Hourly aggregates for the memory fallback path.
+const hourlyMemory = new Map();
 
 function pruneToLimit(limit) {
   if (!db) return;
@@ -106,9 +121,46 @@ if (db) {
   pruneStmt = db.prepare(
     'DELETE FROM request_history WHERE id IN (SELECT id FROM request_history ORDER BY id ASC LIMIT ?)'
   );
+  hourlyUpsertStmt = db.prepare(
+    'INSERT INTO usage_hourly (hour, requests, ok, total_ms) VALUES (?, 1, ?, ?) '
+      + 'ON CONFLICT(hour) DO UPDATE SET requests = requests + 1, '
+      + 'ok = ok + excluded.ok, total_ms = total_ms + excluded.total_ms'
+  );
+  hourlyPruneStmt = db.prepare('DELETE FROM usage_hourly WHERE hour < ?');
   // Drop rows beyond the current cap (e.g. HISTORY_LIMIT was lowered since
   // the last run).
   pruneToLimit(getHistoryLimit());
+}
+
+/**
+ * Fold one completed request into the hourly aggregate row. `ts` is the ISO
+ * timestamp; the hour key is its first 13 characters ("2026-08-12T13"),
+ * which sorts lexicographically the same way it sorts chronologically.
+ */
+function recordHourlyStats(ts, ok, ms) {
+  const hour = String(ts).slice(0, 13);
+  const cutoff = new Date(Date.now() - HOURLY_RETENTION_HOURS * 3600 * 1000)
+    .toISOString()
+    .slice(0, 13);
+
+  if (hourlyUpsertStmt) {
+    try {
+      hourlyUpsertStmt.run(hour, ok ? 1 : 0, ms || 0);
+      hourlyPruneStmt.run(cutoff);
+      return;
+    } catch (_) {
+      // Mirror into the memory map below.
+    }
+  }
+
+  const bucket = hourlyMemory.get(hour) || { hour, requests: 0, ok: 0, totalMs: 0 };
+  bucket.requests += 1;
+  if (ok) bucket.ok += 1;
+  bucket.totalMs += ms || 0;
+  hourlyMemory.set(hour, bucket);
+  for (const key of hourlyMemory.keys()) {
+    if (key < cutoff) hourlyMemory.delete(key);
+  }
 }
 
 /**
@@ -117,6 +169,8 @@ if (db) {
  */
 function recordRequestEntry(entry) {
   const record = { ts: new Date().toISOString(), ...entry };
+
+  recordHourlyStats(record.ts, record.ok, record.ms);
 
   if (insertStmt) {
     try {
@@ -149,50 +203,115 @@ function recordRequestEntry(entry) {
   while (entries.length > limit) entries.shift();
 }
 
+// Normalize to camelCase so API consumers see the same shape whether rows
+// come from SQLite or the in-memory fallback buffer.
+function mapHistoryRow(row) {
+  return {
+    id: row.id,
+    ts: row.ts,
+    endpoint: row.endpoint,
+    model: row.model,
+    ok: Boolean(row.ok),
+    ms: row.ms,
+    error: row.error ?? undefined,
+    stream: Boolean(row.stream),
+    toolCount: row.tool_count,
+    messageCount: row.message_count,
+    inputTokens: row.input_tokens,
+    outputTokens: row.output_tokens,
+    toolCallDepth: row.tool_call_depth,
+    reasoningEffort: row.reasoning_effort,
+    status: row.status,
+  };
+}
+
+function matchesFilters(entry, filters) {
+  if (filters.endpoint && entry.endpoint !== filters.endpoint) return false;
+  if (filters.model && entry.model !== filters.model) return false;
+  if (typeof filters.ok === 'boolean' && Boolean(entry.ok) !== filters.ok) return false;
+  return true;
+}
+
 /**
  * Return recent entries, newest first. `limit` defaults to the history cap.
+ * `filters` optionally narrows by endpoint, model and/or ok outcome.
  */
-function getRecentRequests(limit) {
+function getRecentRequests(limit, filters = {}) {
   const count = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : getHistoryLimit();
+  const hasFilters = Boolean(filters.endpoint || filters.model || typeof filters.ok === 'boolean');
 
   if (recentStmt) {
     try {
-      // Normalize to camelCase so API consumers see the same shape whether
-      // rows come from SQLite or the in-memory fallback buffer.
-      return recentStmt.all(count).map((row) => ({
-        id: row.id,
-        ts: row.ts,
-        endpoint: row.endpoint,
-        model: row.model,
-        ok: Boolean(row.ok),
-        ms: row.ms,
-        error: row.error ?? undefined,
-        stream: Boolean(row.stream),
-        toolCount: row.tool_count,
-        messageCount: row.message_count,
-        inputTokens: row.input_tokens,
-        outputTokens: row.output_tokens,
-        toolCallDepth: row.tool_call_depth,
-        reasoningEffort: row.reasoning_effort,
-        status: row.status,
-      }));
+      let rows;
+      if (hasFilters) {
+        // Filters come from query strings, so always bind them as params —
+        // never splice them into the SQL text.
+        const clauses = [];
+        const params = [];
+        if (filters.endpoint) {
+          clauses.push('endpoint = ?');
+          params.push(filters.endpoint);
+        }
+        if (filters.model) {
+          clauses.push('model = ?');
+          params.push(filters.model);
+        }
+        if (typeof filters.ok === 'boolean') {
+          clauses.push('ok = ?');
+          params.push(filters.ok ? 1 : 0);
+        }
+        const stmt = db.prepare(
+          `SELECT * FROM request_history WHERE ${clauses.join(' AND ')} ORDER BY id DESC LIMIT ?`
+        );
+        rows = stmt.all(...params, count);
+      } else {
+        rows = recentStmt.all(count);
+      }
+      return rows.map(mapHistoryRow);
     } catch (_) {
       // Fall back to the memory buffer below.
     }
   }
 
-  return entries.slice(-count).reverse();
+  const filtered = hasFilters ? entries.filter((entry) => matchesFilters(entry, filters)) : entries;
+  return filtered.slice(-count).reverse();
+}
+
+/**
+ * Hourly aggregates for the trailing `hours` window, oldest first. Only
+ * hours that saw at least one request are returned; the caller fills gaps.
+ */
+function getHourlyStats(hours = 24) {
+  const window = Number.isFinite(hours) && hours > 0 ? Math.min(Math.floor(hours), HOURLY_RETENTION_HOURS) : 24;
+  const cutoff = new Date(Date.now() - window * 3600 * 1000).toISOString().slice(0, 13);
+
+  if (db) {
+    try {
+      return db
+        .prepare('SELECT * FROM usage_hourly WHERE hour >= ? ORDER BY hour ASC')
+        .all(cutoff)
+        .map((row) => ({ hour: row.hour, requests: row.requests, ok: row.ok, totalMs: row.total_ms }));
+    } catch (_) {
+      // Fall back to the memory map below.
+    }
+  }
+
+  return [...hourlyMemory.values()]
+    .filter((bucket) => bucket.hour >= cutoff)
+    .sort((a, b) => (a.hour < b.hour ? -1 : 1));
 }
 
 function resetRequestHistory() {
   if (db) {
     try {
       db.exec('DELETE FROM request_history');
+      db.exec('DELETE FROM usage_hourly');
     } catch (_) {
       // Keep going — still clear the memory buffer.
     }
   }
   entries.length = 0;
+  hourlyMemory.clear();
 }
 
 function closeRequestHistoryDb() {
@@ -211,6 +330,7 @@ function isHistoryPersisted() {
 
 module.exports = {
   closeRequestHistoryDb,
+  getHourlyStats,
   getRecentRequests,
   isHistoryPersisted,
   recordRequestEntry,

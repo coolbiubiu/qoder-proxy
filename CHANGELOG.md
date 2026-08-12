@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-08-12
+
+### Added
+
+- **esbuild production build**: `npm run build` bundles the proxy into a single
+  `dist/server.js`; run it with `npm run start:prod` or `npm run build:start`.
+- **CLI concurrency control**: `MAX_CONCURRENT_CLI` caps simultaneous CLI child
+  processes; extra requests wait in a FIFO queue and fail with `503 proxy_busy`
+  after `CLI_QUEUE_TIMEOUT_MS` (default 60s, `0` = wait indefinitely).
+- **Persisted request history**: per-request outcomes are stored in a SQLite
+  database (`proxy.db`, built-in `node:sqlite`, no new dependencies) so the
+  Recent Requests panel survives restarts. Rows record stream mode, tool count,
+  message count, estimated tokens, tool-call depth, reasoning effort and HTTP
+  status. Databases created by earlier versions are migrated automatically;
+  on Node versions without `node:sqlite` the store degrades to an in-memory
+  ring buffer.
+- **Graceful shutdown**: `SIGINT`/`SIGTERM` terminate in-flight CLI children,
+  persist usage stats, close the history DB after connections drain, then exit.
+- **`/health` enhancements**: `uptime`, `backend` and `slots`
+  (active/queued/max) fields.
+- **Per-request timeout override**: `x-qoder-timeout: <seconds>` header (capped
+  at 600s) wins over `QODERCN_TIMEOUT_MS` for a single request.
+- Web console: Recent Requests table, live dashboard refresh for uptime/slots,
+  config-driven Base URL display.
+- **History filters & export**: `/usage/recent` accepts `endpoint`, `model`
+  and `ok` query filters; the console can export the filtered history as CSV
+  or JSON and opens a per-request detail drawer on row click.
+- **Hourly aggregates & trend chart**: new `usage_hourly` table and
+  `GET /usage/hourly?hours=` (1-168, 7-day retention); the Usage tab renders
+  a 24-hour stacked request/ok/error canvas chart.
+- **Active request management**: `GET /usage/active` lists in-flight
+  requests; `DELETE /usage/active/:id` cancels one, terminating its CLI
+  child (the original request gets 499 `request_cancelled`).
+- **Prometheus endpoint**: `GET /metrics` exposes request counters, a
+  latency histogram and CLI slot gauges (loopback-only, no auth key needed).
+- **SSE live events**: `GET /events` streams `request_completed` events;
+  the console refreshes the Usage tab in near real time.
+- **Retries & model fallback**: `RETRY_COUNT` (max 3) retries transient CLI
+  failures — streaming only retries before the first delta — and
+  `QODER_MODEL_FALLBACK=from=to,...` reruns failed requests once against a
+  fallback model, attributing the response to the model that produced it.
+- **Input size guard**: `MAX_INPUT_TOKENS` rejects oversized prompts with
+  413 `input_too_large` before spawning a CLI child (empty/0 disables).
+- **File logging**: `LOG_FILE` appends every log line to a file for
+  background runs.
+
+### Changed
+
+- Model list updated to the current Qoder lineup (10 models); legacy
+  `-effort-*` suffixed IDs still resolve via reasoning-effort aliases.
+- Non-streaming responses now carry estimated `usage` tokens and unique
+  completion/message IDs.
+- Client disconnects cancel the underlying CLI child process (compatible with
+  Node 17+, where the request `aborted` event no longer exists).
+- Startup sweeps stale prompt attachments left behind by crashed runs.
+
+### Fixed
+
+- `requestsToday` no longer carries yesterday's count across a restart.
+- Test suite no longer touches the user's real `usage.json`/`proxy.db`
+  (`QODER_PROXY_USAGE_FILE`/`QODER_PROXY_DB_FILE` overrides).
+- Streaming failure paths now record usage stats and request history.
+- SQLite history opens in WAL mode with `busy_timeout`, so concurrent
+  instances no longer lose rows to `SQLITE_BUSY`.
+
 ## [1.5.1] - 2026-07-29
 
 ### Fixed

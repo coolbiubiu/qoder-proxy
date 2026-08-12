@@ -56,6 +56,13 @@ test('completed requests show up in /usage/recent history', async () => {
     assert.ok(entry, 'expected a successful chat entry in request history');
     assert.equal(typeof entry.ms, 'number');
     assert.ok(entry.ts);
+    // Per-request detail fields recorded alongside the basic outcome.
+    assert.equal(entry.stream, false);
+    assert.equal(entry.toolCount, 0);
+    assert.equal(entry.messageCount, 1);
+    assert.ok(entry.inputTokens > 0, 'expected estimated input tokens');
+    assert.ok(entry.outputTokens > 0, 'expected estimated output tokens');
+    assert.equal(entry.status, 200);
   } finally {
     qoderCli.runQoderCnCli = originalRun;
     server.close();
@@ -77,6 +84,72 @@ test('invalid x-qoder-timeout header is rejected with 400', async () => {
     assert.equal(body.error.code, 'invalid_timeout');
   } finally {
     qoderCli.runQoderCnCli = originalRun;
+    server.close();
+  }
+});
+
+test('non-streaming responses carry estimated usage and unique IDs', async () => {
+  const originalRun = qoderCli.runQoderCnCli;
+  qoderCli.runQoderCnCli = async () => 'Hello, world!';
+  const { server, baseUrl } = await listen(createApp());
+  try {
+    const body = { messages: [{ role: 'user', content: 'Say hello to me please' }] };
+    const first = await (await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })).json();
+    const second = await (await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })).json();
+
+    assert.ok(first.usage.prompt_tokens > 0, 'prompt_tokens should be estimated');
+    assert.ok(first.usage.completion_tokens > 0, 'completion_tokens should be estimated');
+    assert.equal(first.usage.total_tokens, first.usage.prompt_tokens + first.usage.completion_tokens);
+    assert.notEqual(first.id, second.id, 'completion IDs must not collide');
+  } finally {
+    qoderCli.runQoderCnCli = originalRun;
+    server.close();
+  }
+});
+
+test('streaming failure is counted as an error and recorded in history', async () => {
+  const originalStream = qoderCli.runQoderCnCliStream;
+  qoderCli.runQoderCnCliStream = async () => {
+    throw new Error('boom');
+  };
+  const { server, baseUrl } = await listen(createApp());
+  try {
+    await fetch(`${baseUrl}/usage/reset-local`, { method: 'POST' });
+    const streaming = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(streaming.status, 200);
+    const text = await streaming.text();
+    assert.match(text, /"error"/);
+
+    const usage = await (await fetch(`${baseUrl}/usage/local`)).json();
+    assert.equal(usage.errorCount, 1);
+    const recent = await (await fetch(`${baseUrl}/usage/recent`)).json();
+    assert.ok(recent.requests.some((r) => r.endpoint === 'chat' && r.ok === false));
+  } finally {
+    qoderCli.runQoderCnCliStream = originalStream;
+    server.close();
+  }
+});
+
+test('/usage/recent rejects a non-positive limit', async () => {
+  const { server, baseUrl } = await listen(createApp());
+  try {
+    const rejected = await fetch(`${baseUrl}/usage/recent?limit=0`);
+    assert.equal(rejected.status, 400);
+    const body = await rejected.json();
+    assert.equal(body.error.code, 'invalid_limit');
+  } finally {
     server.close();
   }
 });

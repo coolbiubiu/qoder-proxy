@@ -253,18 +253,25 @@ If you set `PROXY_API_KEY`, replace `not-used` in `opencode.json`'s
 
 ## API Endpoints
 
-With `PROXY_API_KEY` set, `/v1/*` and `/usage/*` require the key; `/health` does not.
+With `PROXY_API_KEY` set, `/v1/*` and `/usage/*` require the key; `/health`, `/metrics` and `/events` do not (they expose aggregate stats only and remain loopback-restricted).
 
 | Method | Path | Key required | Description |
 |--------|------|------|-------------|
 | GET | `/health` | No | Health check, incl. uptime, backend and CLI slot status |
+| GET | `/metrics` | No | Prometheus metrics (request counts, latency histogram, slot gauges) |
+| GET | `/events` | No | SSE event stream (`request_completed`, drives live console refresh) |
 | GET | `/v1/models` | Yes | Model list |
 | POST | `/v1/chat/completions` | Yes | OpenAI-compatible chat with tools field adaptation |
 | POST | `/v1/messages` | Yes | Anthropic-compatible chat with tool_use field adaptation |
 | POST | `/v1/messages/count_tokens` | Yes | Token estimation |
 | GET | `/usage/local` | Yes | Local usage estimate |
-| GET | `/usage/recent` | Yes | Recent request history (persisted in SQLite `proxy.db`, capped by `HISTORY_LIMIT`) |
+| GET | `/usage/recent` | Yes | Recent request history (persisted in SQLite `proxy.db`, capped by `HISTORY_LIMIT`); filterable by `endpoint`/`model`/`ok` |
+| GET | `/usage/hourly` | Yes | Hourly aggregates (requests/ok/total ms), `?hours=` 1-168 |
+| GET | `/usage/active` | Yes | Currently in-flight requests |
+| DELETE | `/usage/active/:id` | Yes | Cancel an in-flight request (terminates its CLI child) |
 | POST | `/usage/reset-local` | Yes | Reset local usage statistics and request history |
+
+> Persisting the request history requires Node 22.5+ for the built-in `node:sqlite` module (no dependencies to install). On older Node versions the store transparently degrades to an in-memory buffer — everything still works, but the history resets with the process.
 
 ## Reasoning Options
 
@@ -282,9 +289,16 @@ A single request may also override the CLI timeout with the `x-qoder-timeout: <s
 
 ## Concurrency Control
 
-Every request spawns a CLI child process. `MAX_CONCURRENT_CLI` caps how many run at once; extra requests wait in a FIFO queue, and `CLI_QUEUE_TIMEOUT_MS` controls queue wait timeout (503 on expiry). The `slots` field of `/health` shows current occupancy and queue depth.
+Every request spawns a CLI child process. `MAX_CONCURRENT_CLI` caps how many run at once; extra requests wait in a FIFO queue, and `CLI_QUEUE_TIMEOUT_MS` controls queue wait timeout (503 on expiry, default 60000ms, set 0 to wait indefinitely). The `slots` field of `/health` shows current occupancy and queue depth.
 
 On `SIGINT`/`SIGTERM` the server shuts down gracefully: it stops accepting connections and terminates in-flight CLI child processes instead of leaving orphans behind.
+
+## Resilience
+
+- `RETRY_COUNT` (default 0, max 3): automatically retry transient CLI failures (crashes, timeouts). Streaming requests only retry before the first delta is sent.
+- `QODER_MODEL_FALLBACK` (e.g. `model-a=model-b`): after the primary model fails (retries exhausted), rerun once against the fallback; the response is attributed to the model that actually produced it.
+- `MAX_INPUT_TOKENS`: requests whose estimated input exceeds the cap are rejected with 413 `input_too_large` before any CLI child is spawned; empty/0 disables the cap.
+- `LOG_FILE`: when set, every log line is also appended to this file, handy for background runs.
 
 ## Streaming
 

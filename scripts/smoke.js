@@ -4,8 +4,8 @@
  * Smoke test for a running Qoder Proxy instance.
  *
  * Usage:
- *   node scripts/smoke-test.js          # quick check: /health + /v1/models
- *   node scripts/smoke-test.js --full   # also test chat and messages endpoints
+ *   node scripts/smoke.js          # quick check: /health + /v1/models
+ *   node scripts/smoke.js --full   # also test chat and messages endpoints
  *
  * The --full flag requires a running proxy with a valid QODERCN_PERSONAL_ACCESS_TOKEN
  * and will make real model calls that consume time and quota.

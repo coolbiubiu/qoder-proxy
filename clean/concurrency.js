@@ -10,9 +10,16 @@ function getMaxConcurrency() {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : Infinity;
 }
 
+// Waiting forever behind full slots leaves clients hanging until their own
+// timeout, so default to a bounded queue wait; an explicit 0 opts back into
+// indefinite waiting.
+const DEFAULT_QUEUE_TIMEOUT_MS = 60000;
+
 function getQueueTimeoutMs() {
-  const value = Number(process.env.CLI_QUEUE_TIMEOUT_MS);
-  return Number.isFinite(value) && value > 0 ? value : 0;
+  const raw = process.env.CLI_QUEUE_TIMEOUT_MS;
+  if (raw === undefined || raw === '') return DEFAULT_QUEUE_TIMEOUT_MS;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 ? value : DEFAULT_QUEUE_TIMEOUT_MS;
 }
 
 let active = 0;
