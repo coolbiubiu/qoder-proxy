@@ -229,16 +229,22 @@ function matchesFilters(entry, filters) {
   if (filters.endpoint && entry.endpoint !== filters.endpoint) return false;
   if (filters.model && entry.model !== filters.model) return false;
   if (typeof filters.ok === 'boolean' && Boolean(entry.ok) !== filters.ok) return false;
+  // ISO timestamps compare correctly as strings.
+  if (filters.from && entry.ts < filters.from) return false;
+  if (filters.to && entry.ts > filters.to) return false;
   return true;
 }
 
 /**
  * Return recent entries, newest first. `limit` defaults to the history cap.
- * `filters` optionally narrows by endpoint, model and/or ok outcome.
+ * `filters` optionally narrows by endpoint, model, ok outcome and a
+ * from/to timestamp range (inclusive, ISO strings).
  */
 function getRecentRequests(limit, filters = {}) {
   const count = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : getHistoryLimit();
-  const hasFilters = Boolean(filters.endpoint || filters.model || typeof filters.ok === 'boolean');
+  const hasFilters = Boolean(
+    filters.endpoint || filters.model || typeof filters.ok === 'boolean' || filters.from || filters.to
+  );
 
   if (recentStmt) {
     try {
@@ -259,6 +265,14 @@ function getRecentRequests(limit, filters = {}) {
         if (typeof filters.ok === 'boolean') {
           clauses.push('ok = ?');
           params.push(filters.ok ? 1 : 0);
+        }
+        if (filters.from) {
+          clauses.push('ts >= ?');
+          params.push(filters.from);
+        }
+        if (filters.to) {
+          clauses.push('ts <= ?');
+          params.push(filters.to);
         }
         const stmt = db.prepare(
           `SELECT * FROM request_history WHERE ${clauses.join(' AND ')} ORDER BY id DESC LIMIT ?`

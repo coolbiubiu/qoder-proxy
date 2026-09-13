@@ -471,8 +471,11 @@ function initConfig() {
 
 // ─── Usage / Credits ─────────────────────────────────────────────────────────
 
-var recentFilters = { endpoint: '', model: '', ok: '' };
+var recentFilters = { endpoint: '', model: '', ok: '', from: '', to: '' };
 var currentRecentRequests = [];
+// Client-side pagination of the (already filtered) recent-request list.
+var recentPage = 1;
+var RECENT_PAGE_SIZE = 10;
 // Coalesces bursts of SSE events into one refresh pass.
 var usageLiveUpdatePending = false;
 
@@ -579,6 +582,9 @@ function loadUsage() {
               '<option value="true">OK only</option>' +
               '<option value="false">Errors only</option>' +
             '</select>' +
+            '<input id="filter-from" type="date" class="usage-filter" title="From date">' +
+            '<span style="color:var(--text-secondary);font-size:0.75rem">–</span>' +
+            '<input id="filter-to" type="date" class="usage-filter" title="To date">' +
             '<button class="btn copy" id="recent-refresh-btn">Refresh</button>' +
             '<button class="btn copy" id="recent-export-csv" title="Download filtered rows as CSV">CSV</button>' +
             '<button class="btn copy" id="recent-export-json" title="Download filtered rows as JSON">JSON</button>' +
@@ -600,6 +606,7 @@ function loadUsage() {
               '<tbody id="recent-requests-body"></tbody>' +
             '</table>' +
           '</div>' +
+          '<div id="recent-pager" style="display:flex;align-items:center;gap:0.375rem;flex-wrap:wrap;padding:0.625rem 1rem;border-top:1px solid rgba(255,255,255,0.06)"></div>' +
         '</div>' +
 
         '<button class="btn danger" id="reset-usage-btn">Reset Local Stats</button>';
@@ -618,10 +625,14 @@ function loadUsage() {
 }
 
 function buildRecentQuery() {
-  var params = ['limit=100'];
+  // Fetch up to the server-side cap (HISTORY_LIMIT, max 1000); pagination
+  // then happens client-side.
+  var params = ['limit=1000'];
   if (recentFilters.endpoint) params.push('endpoint=' + encodeURIComponent(recentFilters.endpoint));
   if (recentFilters.model) params.push('model=' + encodeURIComponent(recentFilters.model));
   if (recentFilters.ok) params.push('ok=' + recentFilters.ok);
+  if (recentFilters.from) params.push('from=' + encodeURIComponent(recentFilters.from));
+  if (recentFilters.to) params.push('to=' + encodeURIComponent(recentFilters.to));
   return '/usage/recent?' + params.join('&');
 }
 
@@ -632,12 +643,77 @@ function loadRecentRequests() {
   api(buildRecentQuery())
     .then(function (recent) {
       currentRecentRequests = (recent && recent.requests) || [];
-      renderRecentRows(tbody, currentRecentRequests);
+      renderRecentPage();
     })
     .catch(function () {
       currentRecentRequests = [];
-      renderRecentRows(tbody, []);
+      renderRecentPage();
     });
+}
+
+// Render the current page of rows plus the pager controls from the
+// already-fetched list — page switches never hit the server.
+function renderRecentPage() {
+  var tbody = document.getElementById('recent-requests-body');
+  if (!tbody) return;
+  var totalPages = Math.max(1, Math.ceil(currentRecentRequests.length / RECENT_PAGE_SIZE));
+  if (recentPage > totalPages) recentPage = totalPages;
+  if (recentPage < 1) recentPage = 1;
+  renderRecentRows(tbody, currentRecentRequests);
+  renderRecentPager(document.getElementById('recent-pager'), currentRecentRequests.length);
+}
+
+function formatRecentTime(ts) {
+  var d = new Date(ts);
+  if (isNaN(d.getTime())) return ts == null ? '-' : String(ts);
+  var pad = function (n) { return String(n).padStart(2, '0'); };
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+    ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+}
+
+function renderRecentPager(container, total) {
+  if (!container) return;
+  var totalPages = Math.max(1, Math.ceil(total / RECENT_PAGE_SIZE));
+  if (!total) {
+    container.innerHTML = '';
+    return;
+  }
+  var start = (recentPage - 1) * RECENT_PAGE_SIZE + 1;
+  var end = Math.min(recentPage * RECENT_PAGE_SIZE, total);
+
+  // Windowed page numbers: first, last and the neighbourhood of the
+  // current page, with ellipsis gaps in between.
+  var pages = [];
+  for (var p = 1; p <= totalPages; p += 1) {
+    if (p === 1 || p === totalPages || Math.abs(p - recentPage) <= 1) pages.push(p);
+  }
+  var buttons = '';
+  var prev = 0;
+  pages.forEach(function (p) {
+    if (p - prev > 1) buttons += '<span style="color:var(--text-secondary)">…</span>';
+    buttons +=
+      '<button class="btn copy recent-page-btn" data-page="' + p + '"' +
+      (p === recentPage ? ' style="font-weight:600"' : '') + '>' + p + '</button>';
+    prev = p;
+  });
+
+  container.innerHTML =
+    '<span style="color:var(--text-secondary);font-size:0.75rem;margin-right:0.25rem">' +
+      start + '–' + end + ' of ' + total + '</span>' +
+    '<button class="btn copy recent-page-btn" data-page="' + (recentPage - 1) + '"' +
+      (recentPage <= 1 ? ' disabled' : '') + '>‹</button>' +
+    buttons +
+    '<button class="btn copy recent-page-btn" data-page="' + (recentPage + 1) + '"' +
+      (recentPage >= totalPages ? ' disabled' : '') + '>›</button>';
+
+  container.querySelectorAll('.recent-page-btn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var page = Number(btn.dataset.page);
+      if (!page || page === recentPage) return;
+      recentPage = page;
+      renderRecentPage();
+    });
+  });
 }
 
 function renderRecentRows(tbody, recent) {
@@ -646,7 +722,9 @@ function renderRecentRows(tbody, recent) {
       '<tr><td colspan="10" style="padding:1rem;text-align:center;color:var(--text-secondary)">No requests recorded.</td></tr>';
     return;
   }
-  tbody.innerHTML = recent.map(function (r, idx) {
+  var offset = (recentPage - 1) * RECENT_PAGE_SIZE;
+  var pageRows = recent.slice(offset, offset + RECENT_PAGE_SIZE);
+  tbody.innerHTML = pageRows.map(function (r, localIdx) {
     var statusHtml = r.ok
       ? '<span style="color:var(--success)">OK</span>'
       : '<span style="color:var(--danger,#f66)">' + escapeHtml(r.error || 'error') + '</span>';
@@ -657,8 +735,8 @@ function renderRecentRows(tbody, recent) {
       ? (r.inputTokens || 0) + ' / ' + (r.outputTokens || 0)
       : '-';
     return (
-      '<tr data-idx="' + idx + '" style="cursor:pointer">' +
-        '<td>' + escapeHtml(new Date(r.ts).toLocaleTimeString()) + '</td>' +
+      '<tr data-idx="' + (offset + localIdx) + '" style="cursor:pointer">' +
+        '<td style="white-space:nowrap">' + escapeHtml(formatRecentTime(r.ts)) + '</td>' +
         '<td><code>' + escapeHtml(r.endpoint || '') + '</code></td>' +
         '<td><code>' + escapeHtml(r.model || '') + '</code></td>' +
         '<td>' + statusHtml + '</td>' +
@@ -728,6 +806,7 @@ function bindUsageControls() {
     endpointSel.value = recentFilters.endpoint;
     endpointSel.addEventListener('change', function () {
       recentFilters.endpoint = endpointSel.value;
+      recentPage = 1;
       loadRecentRequests();
     });
   }
@@ -735,6 +814,7 @@ function bindUsageControls() {
     modelInput.value = recentFilters.model;
     modelInput.addEventListener('change', function () {
       recentFilters.model = modelInput.value.trim();
+      recentPage = 1;
       loadRecentRequests();
     });
   }
@@ -742,6 +822,26 @@ function bindUsageControls() {
     okSel.value = recentFilters.ok;
     okSel.addEventListener('change', function () {
       recentFilters.ok = okSel.value;
+      recentPage = 1;
+      loadRecentRequests();
+    });
+  }
+
+  var fromInput = document.getElementById('filter-from');
+  var toInput = document.getElementById('filter-to');
+  if (fromInput) {
+    fromInput.value = recentFilters.from;
+    fromInput.addEventListener('change', function () {
+      recentFilters.from = fromInput.value;
+      recentPage = 1;
+      loadRecentRequests();
+    });
+  }
+  if (toInput) {
+    toInput.value = recentFilters.to;
+    toInput.addEventListener('change', function () {
+      recentFilters.to = toInput.value;
+      recentPage = 1;
       loadRecentRequests();
     });
   }
@@ -802,6 +902,10 @@ function exportRecent(format) {
 }
 
 function showRequestDetail(entry) {
+  // Close any previously opened detail overlay so only one is visible at a time
+  var existing = document.querySelector('.detail-overlay');
+  if (existing) existing.remove();
+
   var fieldRows = EXPORT_FIELDS.map(function (field) {
     var value = entry[field];
     if (field === 'ts' && value) value = new Date(value).toLocaleString();

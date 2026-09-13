@@ -1238,6 +1238,22 @@ function createApp() {
     res.json(getUsage());
   });
 
+  // Date-range bounds arrive as "YYYY-MM-DD" (a <input type="date"> value)
+  // or any Date-parseable string; normalize to ISO so the history store can
+  // compare timestamps as plain strings. Date-only values span the whole
+  // local day.
+  const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+  function parseRangeBound(value, isEnd) {
+    const input = String(value);
+    const parsed = DATE_ONLY_RE.test(input)
+      ? new Date(`${input}T${isEnd ? '23:59:59.999' : '00:00:00'}`)
+      : new Date(input);
+    if (Number.isNaN(parsed.getTime())) {
+      throw new AppError(400, 'invalid_range', 'from/to must be a valid date.');
+    }
+    return parsed.toISOString();
+  }
+
   app.get('/usage/recent', (req, res) => {
     let limit;
     if (req.query.limit !== undefined) {
@@ -1253,6 +1269,12 @@ function createApp() {
       if (req.query.ok === 'true') filters.ok = true;
       else if (req.query.ok === 'false') filters.ok = false;
       else throw new AppError(400, 'invalid_ok', 'ok must be "true" or "false".');
+    }
+    if (req.query.from !== undefined && req.query.from !== '') {
+      filters.from = parseRangeBound(req.query.from, false);
+    }
+    if (req.query.to !== undefined && req.query.to !== '') {
+      filters.to = parseRangeBound(req.query.to, true);
     }
     res.json({ requests: getRecentRequests(limit, filters) });
   });

@@ -70,6 +70,22 @@ test('/usage/recent supports endpoint, model and ok filters', async () => {
 
     const invalid = await fetch(`${baseUrl}/usage/recent?ok=maybe`);
     assert.equal(invalid.status, 400);
+
+    // Date-range bounds: today spans the entries created above...
+    const today = new Date().toISOString().slice(0, 10);
+    const inRange = await (
+      await fetch(`${baseUrl}/usage/recent?from=${today}&to=${today}`)
+    ).json();
+    assert.ok(inRange.requests.length >= 2);
+
+    // ...while a future window stays empty.
+    const future = await (
+      await fetch(`${baseUrl}/usage/recent?from=2030-01-01`)
+    ).json();
+    assert.equal(future.requests.length, 0);
+
+    const badRange = await fetch(`${baseUrl}/usage/recent?from=not-a-date`);
+    assert.equal(badRange.status, 400);
   } finally {
     qoderCli.runQoderCnCli = originalRun;
     server.close();

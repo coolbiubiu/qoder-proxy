@@ -3,11 +3,14 @@ const path = require('path');
 const { spawn } = require('child_process');
 const { AppError } = require('./errors');
 const { redactString } = require('./redact');
+const log = require('./logger');
 const { resolveModelRoute } = require('./models');
 const { buildToolSystemPrompt, formatToolResultForPrompt } = require('./tool-parser');
 const { withCliSlot } = require('./concurrency');
 
 const DEFAULT_TIMEOUT_MS = 300000;
+// Absolute upper bound for a single CLI run, even when output keeps flowing.
+const HARD_MAX_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
 const ATTACHMENT_INSTRUCTION =
   'Answer the attached OpenAI-compatible chat completion request. Return only the final assistant message content.';
@@ -206,6 +209,14 @@ function extractAssistantContent(stdout) {
   }
 
   throw new AppError(502, 'empty_upstream_output', 'Qoder CN CLI returned no assistant content.');
+}
+
+// Trailing stderr often carries the real upstream reason (context-length
+// errors, rate limits, auth notices) even when the CLI exits cleanly —
+// surface it in API errors instead of dropping it.
+function stderrSuffix(stderrTail, command) {
+  const detail = (stderrTail || '').trim();
+  return detail ? ` (${command}: ${detail})` : '';
 }
 
 function buildChildEnv(token, backend) {
@@ -498,7 +509,7 @@ function shutdownCliProcesses() {
   activeProcesses.clear();
 }
 
-function spawnCli({ spawnSpec, env, rootDir, timeoutMs, attachmentPath, signal, backend, onStdout }) {
+function spawnCli({ spawnSpec, env, rootDir, timeoutMs, attachmentPath, signal, backend, onStdout, stderrSink }) {
   return new Promise((resolve, reject) => {
     let stdoutBytes = 0;
     let stderrBytes = 0;
@@ -521,13 +532,34 @@ function spawnCli({ spawnSpec, env, rootDir, timeoutMs, attachmentPath, signal, 
       clearTimeout(timer);
       signal?.removeEventListener?.('abort', onAbort);
       fs.rmSync(attachmentPath, { force: true });
+      // Expose the redacted stderr tail to callers for error enrichment.
+      if (stderrSink) {
+        const detail = redactString(Buffer.concat(stderrChunks).toString('utf8')).trim();
+        stderrSink.tail = detail.slice(-240);
+      }
       fn(value);
     };
 
-    const timer = setTimeout(() => {
+    // Idle timeout: every stdout/stderr chunk re-arms the timer, so long
+    // requests that keep producing output are not killed mid-flight; only
+    // a CLI that goes fully silent for the whole window is treated as
+    // hung. An absolute cap still bounds runaway runs.
+    const absoluteDeadline = Date.now() + Math.max(timeoutMs, HARD_MAX_TIMEOUT_MS);
+    let timer;
+    const onTimeout = () => {
       timedOut = true;
       child.kill();
-    }, timeoutMs);
+    };
+    const armTimer = () => {
+      clearTimeout(timer);
+      const remaining = absoluteDeadline - Date.now();
+      if (remaining <= 0) {
+        onTimeout();
+        return;
+      }
+      timer = setTimeout(onTimeout, Math.min(timeoutMs, remaining));
+    };
+    armTimer();
 
     const onAbort = () => {
       child.kill();
@@ -551,6 +583,7 @@ function spawnCli({ spawnSpec, env, rootDir, timeoutMs, attachmentPath, signal, 
 
     child.stdout.on('data', (chunk) => {
       try {
+        armTimer();
         stdoutBytes += chunk.length;
         if (stdoutBytes > MAX_OUTPUT_BYTES) {
           throw new AppError(502, 'upstream_output_too_large', `${backend.command} output exceeded the limit.`);
@@ -564,6 +597,7 @@ function spawnCli({ spawnSpec, env, rootDir, timeoutMs, attachmentPath, signal, 
 
     child.stderr.on('data', (chunk) => {
       try {
+        armTimer();
         stderrBytes = appendChunk(stderrChunks, chunk, stderrBytes);
       } catch (error) {
         child.kill();
@@ -574,7 +608,9 @@ function spawnCli({ spawnSpec, env, rootDir, timeoutMs, attachmentPath, signal, 
     child.on('close', (code) => {
       if (settled) return;
       if (timedOut) {
-        finish(reject, new AppError(504, 'upstream_timeout', `${backend.command} request timed out.`));
+        const stderr = redactString(Buffer.concat(stderrChunks).toString('utf8')).trim();
+        const suffix = stderr ? ` ${stderr.slice(-240)}` : '';
+        finish(reject, new AppError(504, 'upstream_timeout', `${backend.command} request timed out.${suffix}`));
         return;
       }
       if (code !== 0) {
@@ -613,15 +649,26 @@ function runQoderCnCli({
     });
 
     const stdoutChunks = [];
+    const stderrSink = {};
     await spawnCli({
       ...prepared,
       rootDir,
       signal,
+      stderrSink,
       onStdout: (chunk) => stdoutChunks.push(chunk),
     });
 
     const stdout = Buffer.concat(stdoutChunks).toString('utf8');
-    return extractAssistantContent(stdout);
+    try {
+      return extractAssistantContent(stdout);
+    } catch (error) {
+      // The CLI exited cleanly but gave us nothing usable — its stderr is
+      // the best explanation we have, so attach it to the API error.
+      if (error.code === 'empty_upstream_output' || error.code === 'invalid_upstream_output') {
+        error.message += stderrSuffix(stderrSink.tail, prepared.backend.command);
+      }
+      throw error;
+    }
   });
 }
 
@@ -699,10 +746,12 @@ function runQoderCnCliStream({
       }
     };
 
+    const stderrSink = {};
     await spawnCli({
       ...prepared,
       rootDir,
       signal,
+      stderrSink,
       onStdout: (chunk) => {
         lineBuffer += chunk.toString('utf8');
         const lines = lineBuffer.split(/\r?\n/);
@@ -731,6 +780,12 @@ function runQoderCnCliStream({
           break;
         }
       }
+    }
+
+    // A clean exit with no text at all usually means the upstream refused
+    // the request; stderr typically says why.
+    if (!fullTextParts.length && stderrSink.tail) {
+      log.warn('CLI stream produced no text', { stderr: stderrSink.tail });
     }
 
     return fullTextParts.join('');
